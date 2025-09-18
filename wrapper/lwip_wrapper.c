@@ -75,6 +75,20 @@ void conn_unref(connection_entry_t* conn) {
     }
 }
 
+const ip_addr_t* get_connection_src_ip(connection_entry_t* conn) {
+    if (conn) {
+        return (const ip_addr_t*)&conn->src_ip;
+    }
+    return NULL;
+}
+
+int get_connection_netif_num(connection_entry_t* conn) {
+    if (conn) {
+        return conn->netif.num;
+    }
+    return -1;
+}
+
 static err_t output_cb(struct netif* netif, struct pbuf* p, const ip4_addr_t* ipaddr) {
     if (!netif || !netif->state || !p) {
         printf("ERROR: Invalid parameters in output_cb\n");
@@ -322,7 +336,7 @@ int lwip_create_connection(const char* id,
     conn->udp_callback = udp_cb;
     conn->tcp_complete_callback = tcp_complete_cb;
     conn->netif.state = conn;
-    conn->ref_count = 1;  // Initial reference
+    conn->ref_count = 1;  // Initial reference    
 
     if (!netif_add(&conn->netif, &src_ip, &netmask, &gw, conn, netif_init_cb, netif_input)) {
         free(conn->id);
@@ -490,30 +504,6 @@ void lwip_close_connection(const char* id) {
     lwip_unlock();
     printf("Connection '%s' not found to close.\n", id);
 }
-
-/*
-struct netif* ip4_route_custom(const ip4_addr_t* src, const ip4_addr_t* dest) {
-    if (!src) {
-        printf("ip4_route_custom: source IP is NULL\n");
-        return NULL;
-    }
-
-    lwip_lock();
-    connection_entry_t* conn = connection_list;
-    while (conn) {
-        if (ip4_addr_cmp(&conn->src_ip, src)) {
-            struct netif* result = &conn->netif;
-            lwip_unlock();
-            return result;
-        }
-        conn = conn->next;
-    }
-    lwip_unlock();
-
-    printf("Netif not found for source IP %s\n", ip4addr_ntoa(src));
-    return NULL;
-}
-*/
 
 void* ip4_route_custom(const void* src, const void* dest) {
     if (!src) {

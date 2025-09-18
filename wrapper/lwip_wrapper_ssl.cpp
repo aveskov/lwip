@@ -33,9 +33,7 @@ extern "C" {
 
     typedef struct ssl_connection_entry {
         char* id;
-        struct netif netif;
         struct tcp_pcb* pcb;
-        ip4_addr_t src_ip;
 
         // SSL context
         SSL_CTX* ssl_ctx;
@@ -453,9 +451,19 @@ extern "C" {
             lwip_unlock();
             lwip_ssl_close_connection(id);
             return -1;
+        }		
+        
+		ssl_conn->pcb->netif_idx = get_connection_netif_num(base_conn);
+
+        const ip_addr_t* src_ip_ptr = get_connection_src_ip(base_conn);
+        if (!src_ip_ptr) {
+            lwip_unlock();
+            lwip_ssl_close_connection(id);
+            conn_unref(base_conn);
+            return -1;
         }
 
-        err_t bind_result = tcp_bind(ssl_conn->pcb, IP_ADDR_ANY, 0);
+        err_t bind_result = tcp_bind(ssl_conn->pcb, src_ip_ptr, 0);
         if (bind_result != ERR_OK) {
             tcp_abort(ssl_conn->pcb);
             ssl_conn->pcb = NULL;

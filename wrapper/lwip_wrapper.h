@@ -38,6 +38,8 @@ extern "C" {
     void conn_unref(connection_entry_t* conn);
     void lwip_lock(void);
     void lwip_unlock(void);    
+    const ip_addr_t* get_connection_src_ip(connection_entry_t* conn);
+    int get_connection_netif_num(connection_entry_t* conn);
 
     // Custom routing
     void* ip4_route_custom(const void* src, const void* dest);
