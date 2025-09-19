@@ -82,11 +82,11 @@ const ip_addr_t* get_connection_src_ip(connection_entry_t* conn) {
     return NULL;
 }
 
-int get_connection_netif_num(connection_entry_t* conn) {
+struct netif* get_connection_netif(connection_entry_t* conn) {
     if (conn) {
-        return conn->netif.num;
+        return &conn->netif;
     }
-    return -1;
+    return NULL;
 }
 
 static err_t output_cb(struct netif* netif, struct pbuf* p, const ip4_addr_t* ipaddr) {

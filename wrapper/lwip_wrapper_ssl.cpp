@@ -34,6 +34,7 @@ extern "C" {
     typedef struct ssl_connection_entry {
         char* id;
         struct tcp_pcb* pcb;
+        struct netif* base_netif;
 
         // SSL context
         SSL_CTX* ssl_ctx;
@@ -276,7 +277,7 @@ extern "C" {
     }
 
     static err_t ssl_tcp_connected_cb(void* arg, struct tcp_pcb* tpcb, err_t err) {
-        ssl_connection_entry_t* conn = (ssl_connection_entry_t*)arg;
+        ssl_connection_entry_t* conn = (ssl_connection_entry_t*)arg;		
 
         if (!conn || err != ERR_OK) {
             if (conn) ssl_conn_unref(conn);
@@ -396,6 +397,8 @@ extern "C" {
         ssl_conn->ref_count = 1;
         ssl_conn->state = SSL_STATE_CONNECTING;
 
+        ssl_conn->base_netif = get_connection_netif(base_conn);
+
         if (hostname) {
             ssl_conn->hostname = _strdup(hostname);
         }
@@ -453,8 +456,6 @@ extern "C" {
             return -1;
         }		
         
-		ssl_conn->pcb->netif_idx = get_connection_netif_num(base_conn);
-
         const ip_addr_t* src_ip_ptr = get_connection_src_ip(base_conn);
         if (!src_ip_ptr) {
             lwip_unlock();
@@ -462,6 +463,8 @@ extern "C" {
             conn_unref(base_conn);
             return -1;
         }
+
+        ssl_conn->pcb->local_ip = *src_ip_ptr;
 
         err_t bind_result = tcp_bind(ssl_conn->pcb, src_ip_ptr, 0);
         if (bind_result != ERR_OK) {
@@ -471,6 +474,8 @@ extern "C" {
             lwip_ssl_close_connection(id);
             return -1;
         }
+
+        tcp_bind_netif(ssl_conn->pcb, ssl_conn->base_netif);
 
         tcp_arg(ssl_conn->pcb, ssl_conn);
         tcp_recv(ssl_conn->pcb, ssl_tcp_recv_cb);
