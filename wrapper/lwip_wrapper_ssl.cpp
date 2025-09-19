@@ -152,6 +152,8 @@ extern "C" {
     static void ssl_process_handshake(ssl_connection_entry_t* conn) {
         if (conn->state != SSL_STATE_HANDSHAKING) return;
 
+        printf("SSL process handshake\n");
+
         int ret = SSL_do_handshake(conn->ssl);
         ssl_flush_write_bio(conn);
 
@@ -163,10 +165,11 @@ extern "C" {
             if (conn->handshake_complete_callback) {
                 conn->handshake_complete_callback(1);  // Success
             }
-
         }
         else {
             int ssl_error = SSL_get_error(conn->ssl, ret);
+
+            printf("SSL handshake is failed '%d'\n", ssl_error);
 
             if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
                 // Need more data, continue handshake later
