@@ -319,7 +319,7 @@ extern "C" {
 
             SSL_CTX_set_verify(global_ssl_ctx, SSL_VERIFY_PEER, NULL);
             SSL_CTX_set_default_verify_paths(global_ssl_ctx);
-
+            
             ssl_initialized = 1;
             printf("SSL initialization completed\n");
         }
@@ -539,15 +539,27 @@ extern "C" {
                 *prev = conn->next;
 
                 if (conn->ssl && conn->state == SSL_STATE_CONNECTED) {
-                    SSL_shutdown(conn->ssl);
+                    // Graceful TLS shutdown: call SSL_shutdown until it returns 1
+                    int shutdown_status = SSL_shutdown(conn->ssl);
                     ssl_flush_write_bio(conn);
+                    if (shutdown_status == 0) {
+                        // Need to call a second time to wait for peer close_notify
+                        shutdown_status = SSL_shutdown(conn->ssl);
+                        ssl_flush_write_bio(conn);
+                    }
                 }
 
                 conn->state = SSL_STATE_CLOSING;
 
                 if (conn->pcb) {
                     lwip_lock();
-                    tcp_abort(conn->pcb);
+                    // Attempt a graceful TCP close
+                    err_t err = tcp_close(conn->pcb);
+                    if (err != ERR_OK) {
+                        // If tcp_close() fails (e.g. data unacked), you may want to wait/retry.
+                        // As a last resort, fall back to abort:
+                        tcp_abort(conn->pcb);
+                    }
                     lwip_unlock();
                     conn->pcb = NULL;
                 }
@@ -583,7 +595,7 @@ extern "C" {
 
         if (SSL_CTX_load_verify_locations(global_ssl_ctx, ca_path, NULL) != 1) {
             return -1;
-        }
+        }        
 
         return 0;
     }
