@@ -74,6 +74,9 @@ extern "C" {
             if (conn->ssl) {
                 SSL_free(conn->ssl);
             }
+            if (conn->ssl_ctx) {
+                SSL_CTX_free(conn->ssl_ctx);
+            }
             if (conn->id) free(conn->id);
             if (conn->hostname) free(conn->hostname);
             free(conn);
@@ -296,6 +299,18 @@ extern "C" {
         return ERR_OK;
     }
 
+    static SSL_CTX* create_ssl_ctx() {
+        SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx) {
+            return NULL;
+        }
+
+        SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+        
+        return ctx;
+    }
+
     void lwip_ssl_init_global(void) {
         if (!ssl_initialized) {
             InitializeCriticalSection(&ssl_lock_var);
@@ -303,22 +318,6 @@ extern "C" {
             // Initialize BoringSSL
             SSL_library_init();
             SSL_load_error_strings();
-            OpenSSL_add_all_algorithms();
-
-            // Create global SSL context
-            global_ssl_ctx = SSL_CTX_new(TLS_client_method());
-            if (!global_ssl_ctx) {
-                printf("Failed to create global SSL context\n");
-                return;
-            }
-
-            // Set options
-            SSL_CTX_set_options(global_ssl_ctx,
-                SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 |
-                SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1);
-
-            SSL_CTX_set_verify(global_ssl_ctx, SSL_VERIFY_PEER, NULL);
-            SSL_CTX_set_default_verify_paths(global_ssl_ctx);
             
             ssl_initialized = 1;
             printf("SSL initialization completed\n");
@@ -334,12 +333,6 @@ extern "C" {
                 ssl_connection_entry_t* conn = ssl_connection_list;
                 ssl_connection_list = conn->next;
                 ssl_conn_unref(conn);
-            }
-
-            // Cleanup global SSL context
-            if (global_ssl_ctx) {
-                SSL_CTX_free(global_ssl_ctx);
-                global_ssl_ctx = NULL;
             }
 
             ssl_unlock();
@@ -410,9 +403,19 @@ extern "C" {
         ssl_conn->handshake_complete_callback = handshake_complete_cb;
         ssl_conn->data_received_callback = data_received_cb;
         ssl_conn->ssl_complete_callback = ssl_complete_cb;
-
+       
         // Create SSL objects
-        ssl_conn->ssl_ctx = global_ssl_ctx;
+        ssl_conn->ssl_ctx = create_ssl_ctx();
+        if (!ssl_conn->ssl_ctx) {
+            printf("Failed to create per-connection SSL_CTX with CA\n");
+            free(ssl_conn->id);
+            if (ssl_conn->hostname) free(ssl_conn->hostname);
+            free(ssl_conn);
+            ssl_unlock();
+            conn_unref(base_conn);
+            return -1;
+        }
+
         ssl_conn->ssl = SSL_new(ssl_conn->ssl_ctx);
         ssl_conn->rbio = BIO_new(BIO_s_mem());
         ssl_conn->wbio = BIO_new(BIO_s_mem());
@@ -535,76 +538,11 @@ extern "C" {
         ssl_connection_entry_t* conn = ssl_connection_list;
 
         while (conn) {
-            if (conn->id && strcmp(conn->id, id) == 0) {
-                *prev = conn->next;
 
-                if (conn->ssl && conn->state == SSL_STATE_CONNECTED) {
-                    // Graceful TLS shutdown: call SSL_shutdown until it returns 1
-                    int shutdown_status = SSL_shutdown(conn->ssl);
-                    ssl_flush_write_bio(conn);
-                    if (shutdown_status == 0) {
-                        // Need to call a second time to wait for peer close_notify
-                        shutdown_status = SSL_shutdown(conn->ssl);
-                        ssl_flush_write_bio(conn);
-                    }
-                }
-
-                conn->state = SSL_STATE_CLOSING;
-
-                if (conn->pcb) {
-                    lwip_lock();
-                    // Attempt a graceful TCP close
-                    err_t err = tcp_close(conn->pcb);
-                    if (err != ERR_OK) {
-                        // If tcp_close() fails (e.g. data unacked), you may want to wait/retry.
-                        // As a last resort, fall back to abort:
-                        tcp_abort(conn->pcb);
-                    }
-                    lwip_unlock();
-                    conn->pcb = NULL;
-                }
-
-                ssl_unlock();
-                ssl_conn_unref(conn);
-                printf("SSL connection '%s' closed\n", id);
-                return;
-            }
             prev = &conn->next;
             conn = conn->next;
         }
 
         ssl_unlock();
-    }
-
-    int lwip_ssl_load_client_cert(const char* cert_file, const char* key_file) {
-        if (!global_ssl_ctx || !cert_file || !key_file) return -1;
-
-        if (SSL_CTX_use_certificate_file(global_ssl_ctx, cert_file, SSL_FILETYPE_PEM) != 1) {
-            return -1;
-        }
-
-        if (SSL_CTX_use_PrivateKey_file(global_ssl_ctx, key_file, SSL_FILETYPE_PEM) != 1) {
-            return -1;
-        }
-
-        return 0;
-    }
-
-    int lwip_ssl_set_ca_cert_path(const char* ca_path) {
-        if (!global_ssl_ctx || !ca_path) return -1;
-
-        if (SSL_CTX_load_verify_locations(global_ssl_ctx, ca_path, NULL) != 1) {
-            return -1;
-        }        
-
-        return 0;
-    }
-
-    int lwip_ssl_set_verify_mode(int verify_mode) {
-        if (!global_ssl_ctx) return -1;
-
-        SSL_CTX_set_verify(global_ssl_ctx, verify_mode, NULL);
-        return 0;
-    }
-
+    }  
 } // extern "C"

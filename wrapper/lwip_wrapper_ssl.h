@@ -16,15 +16,12 @@ __declspec(dllexport) void lwip_ssl_cleanup_global(void);
 __declspec(dllexport) int lwip_ssl_connect(const char* id,
                      const char* dest_ip_str, 
                      int port,
-                     const char* hostname,                
+                     const char* hostname,     
 	                 ssl_handshake_complete_callback_t handshake_complete_cb,
                      ssl_data_received_callback_t data_received_cb,
                      ssl_send_complete_callback_t ssl_complete_cb);
 __declspec(dllexport) int lwip_ssl_send_data(const char* id, const uint8_t* data, size_t len);
 __declspec(dllexport) void lwip_ssl_close_connection(const char* id);
-__declspec(dllexport) int lwip_ssl_load_client_cert(const char* cert_file, const char* key_file);
-__declspec(dllexport) int lwip_ssl_set_ca_cert_path(const char* ca_path);
-__declspec(dllexport) int lwip_ssl_set_verify_mode(int verify_mode);
 
 #ifdef __cplusplus
 }
