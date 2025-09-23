@@ -105,7 +105,7 @@ extern "C" {
         ssl_unlock();
 
         if (!conn) {
-            printf("SSL Connection '%s' not found.\n", id ? id : "NULL");
+            printf("ERROR: SSL Connection '%s' not found.\n", id ? id : "NULL");
         }
         return conn;
     }
@@ -142,7 +142,7 @@ extern "C" {
                 tcp_output(conn->pcb);
             }
             else {
-                printf("Failed to send SSL data via TCP: %d\n", err);
+                printf("ERROR: Failed to send SSL data via TCP: %d\n", err);
             }
             lwip_unlock();
 
@@ -153,26 +153,21 @@ extern "C" {
     }
 
     static void ssl_process_handshake(ssl_connection_entry_t* conn) {
-        if (conn->state != SSL_STATE_HANDSHAKING) return;
-
-        printf("SSL process handshake\n");
+        if (conn->state != SSL_STATE_HANDSHAKING) return;        
 
         int ret = SSL_do_handshake(conn->ssl);
         ssl_flush_write_bio(conn);
 
         if (ret == 1) {
             // Handshake completed successfully
-            conn->state = SSL_STATE_CONNECTED;
-            printf("SSL handshake completed successfully for connection '%s'\n", conn->id);
+            conn->state = SSL_STATE_CONNECTED;            
 
             if (conn->handshake_complete_callback) {
                 conn->handshake_complete_callback(1);  // Success
             }
         }
         else {
-            int ssl_error = SSL_get_error(conn->ssl, ret);
-
-            printf("SSL handshake is failed '%d'\n", ssl_error);
+            int ssl_error = SSL_get_error(conn->ssl, ret);            
 
             if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
                 // Need more data, continue handshake later
@@ -288,9 +283,7 @@ extern "C" {
         if (!conn || err != ERR_OK) {
             if (conn) ssl_conn_unref(conn);
             return err;
-        }
-
-        printf("TCP connected for SSL connection '%s', starting SSL handshake\n", conn->id);
+        }        
 
         // Start SSL handshake
         conn->state = SSL_STATE_HANDSHAKING;
@@ -319,8 +312,7 @@ extern "C" {
             SSL_library_init();
             SSL_load_error_strings();
             
-            ssl_initialized = 1;
-            printf("SSL initialization completed\n");
+            ssl_initialized = 1;            
         }
     }
 
@@ -407,7 +399,7 @@ extern "C" {
         // Create SSL objects
         ssl_conn->ssl_ctx = create_ssl_ctx();
         if (!ssl_conn->ssl_ctx) {
-            printf("Failed to create per-connection SSL_CTX with CA\n");
+            printf("ERROR: Failed to create per-connection SSL_CTX with CA\n");
             free(ssl_conn->id);
             if (ssl_conn->hostname) free(ssl_conn->hostname);
             free(ssl_conn);
@@ -498,7 +490,6 @@ extern "C" {
             return -1;
         }
 
-        printf("SSL connection to %s:%d initiated\n", dest_ip_str, port);
         return 0;
     }
 

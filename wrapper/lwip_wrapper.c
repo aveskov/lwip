@@ -148,9 +148,7 @@ static void input_cb(connection_entry_t* conn, const uint8_t* data, int len) {
 
 static err_t on_tcp_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
     connection_entry_t* conn = (connection_entry_t*)arg;
-    if (!conn) return ERR_ARG;
-
-    printf("TCP sent callback (len = %u)\n", len);
+    if (!conn) return ERR_ARG;    
 
     if (conn->tcp_complete_callback) {
         conn->tcp_complete_callback();
@@ -221,9 +219,7 @@ static err_t tcp_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
         pbuf_free(p);
         if (conn) conn_unref(conn);
         return err;
-    }
-
-    printf("Received: %.*s\n", (int)p->len, (char*)p->payload);
+    }    
 
     lwip_lock();
     if (tpcb) {
@@ -351,7 +347,6 @@ int lwip_create_connection(const char* id,
     connection_list = conn;
 
     lwip_unlock();
-    printf("Connection '%s' created successfully\n", id);
     return 0;
 }
 
@@ -401,7 +396,7 @@ int lwip_connect(const char* id, const char* dest_ip_str, int port, const char* 
     lwip_lock();
 
     if (conn->pcb != NULL) {
-        printf("Connection %s already active\n", id);
+        printf("ERROR: Connection %s already active\n", id);
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -431,7 +426,7 @@ int lwip_connect(const char* id, const char* dest_ip_str, int port, const char* 
 
     err_t bind_result = tcp_bind(conn->pcb, &conn->pcb->local_ip, 0);
     if (bind_result != ERR_OK) {
-        printf("tcp_bind failed: %d\n", bind_result);
+        printf("ERROR: tcp_bind failed: %d\n", bind_result);
         tcp_abort(conn->pcb);
         if (conn->message) {
             free(conn->message);
@@ -453,13 +448,12 @@ int lwip_connect(const char* id, const char* dest_ip_str, int port, const char* 
     lwip_unlock();
 
     if (ret != ERR_OK) {
-        printf("tcp_connect failed: %d\n", ret);
+        printf("ERROR: tcp_connect failed: %d\n", ret);
         conn_unref(conn);  // Remove callback reference
         conn_unref(conn);  // Remove find reference
         return -1;
     }
 
-    printf("tcp_connect to %s:%d with ID '%s' initiated successfully\n", dest_ip_str, port, id);
     conn_unref(conn);  // Release find reference
     return 0;
 }
@@ -507,7 +501,7 @@ void lwip_close_connection(const char* id) {
 
 void* ip4_route_custom(const void* src, const void* dest) {
     if (!src) {
-        printf("ip4_route_custom: source IP is empty\n");
+        printf("ERROR: ip4_route_custom: source IP is empty\n");
         return NULL;
     }
 

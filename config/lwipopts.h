@@ -27,11 +27,11 @@ void* ip4_route_custom(const void* src_ip, const void* dest_ip);
 #define LWIP_TIMEVAL_PRIVATE            0
 
 // Stats & Debugging
-#define LWIP_DEBUG                      1
-#define TCP_DEBUG                       LWIP_DBG_ON
-#define PBUF_DEBUG                      LWIP_DBG_ON
-#define MEM_DEBUG                       LWIP_DBG_ON
-#define MEMP_DEBUG                      LWIP_DBG_ON
+#define LWIP_DEBUG                      0
+#define TCP_DEBUG                       LWIP_DBG_OFF
+#define PBUF_DEBUG                      LWIP_DBG_OFF
+#define MEM_DEBUG                       LWIP_DBG_OFF
+#define MEMP_DEBUG                      LWIP_DBG_OFF
 #define LWIP_STATS                      0
 
 // No high-level APIs needed
