@@ -445,15 +445,22 @@ int lwip_connect(const char* id, const char* dest_ip_str, int port, const char* 
     conn_ref(conn);  // Add reference for callbacks
     err_t ret = tcp_connect(conn->pcb, &dest_ip, port, tcp_connected);
 
-    lwip_unlock();
-
     if (ret != ERR_OK) {
         printf("ERROR: tcp_connect failed: %d\n", ret);
+        // Clean up on connect failure
+        tcp_abort(conn->pcb);
+        conn->pcb = NULL;
+        if (conn->message) {
+            free(conn->message);
+            conn->message = NULL;
+        }
+        lwip_unlock();
         conn_unref(conn);  // Remove callback reference
         conn_unref(conn);  // Remove find reference
         return -1;
     }
 
+    lwip_unlock();
     conn_unref(conn);  // Release find reference
     return 0;
 }

@@ -529,11 +529,44 @@ extern "C" {
         ssl_connection_entry_t* conn = ssl_connection_list;
 
         while (conn) {
+            if (conn->id && strcmp(conn->id, id) == 0) {
+                *prev = conn->next;
 
+                if (conn->ssl && conn->state == SSL_STATE_CONNECTED) {
+                    // Graceful TLS shutdown: call SSL_shutdown until it returns 1
+                    int shutdown_status = SSL_shutdown(conn->ssl);
+                    ssl_flush_write_bio(conn);
+                    if (shutdown_status == 0) {
+                        // Need to call a second time to wait for peer close_notify
+                        shutdown_status = SSL_shutdown(conn->ssl);
+                        ssl_flush_write_bio(conn);
+                    }
+                }
+
+                conn->state = SSL_STATE_CLOSING;
+
+                if (conn->pcb) {
+                    lwip_lock();
+                    // Attempt a graceful TCP close
+                    err_t err = tcp_close(conn->pcb);
+                    if (err != ERR_OK) {
+                        // If tcp_close() fails (e.g. data unacked), you may want to wait/retry.
+                        // As a last resort, fall back to abort:
+                        tcp_abort(conn->pcb);
+                    }
+                    lwip_unlock();
+                    conn->pcb = NULL;
+                }
+
+                ssl_unlock();
+                ssl_conn_unref(conn);
+                printf("SSL connection '%s' closed\n", id);
+                return;
+            }
             prev = &conn->next;
             conn = conn->next;
         }
 
         ssl_unlock();
-    }  
+    }
 } // extern "C"
