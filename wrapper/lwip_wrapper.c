@@ -6,6 +6,7 @@
 #include "lwip/init.h"
 #include "lwip/netif.h"
 #include "lwip/tcp.h"
+#include "lwip/udp.h"
 #include "lwip/ip_addr.h"
 #include "lwip/timeouts.h"
 #include "lwip/pbuf.h"
@@ -20,10 +21,11 @@ typedef struct connection_entry {
     char* id;
     struct netif netif;
     struct tcp_pcb* pcb;
+    struct udp_pcb* udp_pcb;
     ip4_addr_t src_ip;
     char* message;
     udp_send_callback_t udp_callback;
-    tcp_send_complete_callback_t tcp_complete_callback;
+    send_complete_callback_t send_complete_callback;
     struct connection_entry* next;
     volatile int ref_count;  // Reference counting for safe cleanup
 } connection_entry_t;
@@ -150,8 +152,8 @@ static err_t on_tcp_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
     connection_entry_t* conn = (connection_entry_t*)arg;
     if (!conn) return ERR_ARG;    
 
-    if (conn->tcp_complete_callback) {
-        conn->tcp_complete_callback();
+    if (conn->send_complete_callback) {
+        conn->send_complete_callback();
     }
 
     lwip_lock();
@@ -247,6 +249,10 @@ static void on_tcp_error(void* arg, err_t err) {
     }
 }
 
+static void udp_recv_cb(void* arg, struct udp_pcb* pcb, struct pbuf* p, const ip_addr_t* addr, u16_t port) {   
+    pbuf_free(p);
+}
+
 static err_t netif_init_cb(struct netif* netif) {
     if (!netif) return ERR_ARG;
 
@@ -289,7 +295,7 @@ int lwip_create_connection(const char* id,
     const char* netmask_str,
     const char* gw_str,
     udp_send_callback_t udp_cb,
-    tcp_send_complete_callback_t tcp_complete_cb) {
+    send_complete_callback_t send_complete_cb) {
 
     if (!id || !src_ip_str || !netmask_str || !gw_str) {
         printf("ERROR: Invalid parameters for connection creation\n");
@@ -330,7 +336,7 @@ int lwip_create_connection(const char* id,
 
     conn->src_ip = src_ip;
     conn->udp_callback = udp_cb;
-    conn->tcp_complete_callback = tcp_complete_cb;
+    conn->send_complete_callback = send_complete_cb;
     conn->netif.state = conn;
     conn->ref_count = 1;  // Initial reference    
 
@@ -364,7 +370,7 @@ void lwip_init_stack_global() {
     netif_set_default(NULL);
 }
 
-void lwip_process_packet(const char* id, uint8_t* data, int len) {
+void lwip_process_packet(const char* id, const uint8_t* data, int len) {
     if (!id || !data || len <= 0) {
         printf("ERROR: Invalid parameters for packet processing\n");
         return;
@@ -377,7 +383,7 @@ void lwip_process_packet(const char* id, uint8_t* data, int len) {
     }
 }
 
-int lwip_connect(const char* id, const char* dest_ip_str, int port, const char* message) {
+int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char* message) {
     if (!id || !dest_ip_str || port <= 0 || port > 65535) {
         printf("ERROR: Invalid parameters for connection\n");
         return -1;
@@ -465,6 +471,99 @@ int lwip_connect(const char* id, const char* dest_ip_str, int port, const char* 
     return 0;
 }
 
+int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8_t* data, int len) {
+    if (!id || !dest_ip_str || port <= 0 || port > 65535 || !data || len <= 0) {
+        printf("ERROR: Invalid parameters for UDP send\n");
+        return -1;
+    }
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) {
+        printf("ERROR: Connection '%s' not found for UDP send\n", id);
+        return -1;
+    }
+
+    ip_addr_t dest_ip;
+    if (!ipaddr_aton(dest_ip_str, &dest_ip)) {
+        printf("ERROR: Invalid destination IP address for UDP send\n");
+        conn_unref(conn);
+        return -1;
+    }
+
+    lwip_lock();
+
+    // Check if UDP is already bound
+    if (conn->udp_pcb != NULL) {
+        printf("ERROR: UDP already bound for connection '%s'\n", id);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    // Create new UDP PCB
+    conn->udp_pcb = udp_new();
+    if (!conn->udp_pcb) {
+        printf("ERROR: Failed to create UDP PCB for connection '%s'\n", id);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    // Bind to local port
+    err_t err = udp_bind(conn->udp_pcb, &conn->src_ip, 0);
+    if (err != ERR_OK) {
+        printf("ERROR: UDP bind failed for connection '%s': %d\n", id, err);
+        udp_remove(conn->udp_pcb);
+        conn->udp_pcb = NULL;
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    // Set receive callback    
+    udp_recv(conn->udp_pcb, udp_recv_cb, conn);
+
+    // Allocate pbuf for the data
+    struct pbuf* p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
+    if (!p) {
+        printf("ERROR: Failed to allocate pbuf for UDP send\n");
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    // Copy data to pbuf
+    if (pbuf_take(p, data, len) != ERR_OK) {
+        printf("ERROR: Failed to copy data to pbuf for UDP send\n");
+        pbuf_free(p);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    // Send the packet
+    err_t err_sendto = udp_sendto(conn->udp_pcb, p, &dest_ip, port);
+
+    // Cleanup pbuf
+    pbuf_free(p);
+
+    if (err_sendto != ERR_OK) {
+        printf("ERROR: UDP send failed: %d\n", err);
+        return -1;
+    }
+
+    lwip_unlock();
+
+    if (conn->send_complete_callback) {
+        conn->send_complete_callback();
+    }
+
+    conn_unref(conn);
+    
+    return 0;
+}
+
+
 void lwip_close_connection(const char* id) {
     if (!id) {
         printf("ERROR: Invalid connection ID\n");
@@ -488,6 +587,12 @@ void lwip_close_connection(const char* id) {
             if (conn->pcb) {
                 tcp_abort(conn->pcb);
                 conn->pcb = NULL;
+            }
+
+            // Close UDP connection if active
+            if (conn->udp_pcb) {
+                udp_remove(conn->udp_pcb);
+                conn->udp_pcb = NULL;
             }
 
             lwip_unlock();
@@ -545,6 +650,10 @@ void lwip_cleanup_all_connections() {
 
         if (conn->pcb) {
             tcp_abort(conn->pcb);
+        }
+
+        if (conn->udp_pcb) {
+            udp_remove(conn->udp_pcb);
         }
 
         conn_unref(conn);

@@ -493,7 +493,7 @@ extern "C" {
         return 0;
     }
 
-    int lwip_ssl_send_data(const char* id, const uint8_t* data, size_t len) {
+    int lwip_ssl_send_data(const char* id, const uint8_t* data, int len) {
         ssl_connection_entry_t* conn = find_ssl_connection(id);
         if (!conn) return -1;
 
@@ -502,7 +502,7 @@ extern "C" {
             return -1;
         }
 
-        int bytes_written = SSL_write(conn->ssl, data, (int)len);
+        int bytes_written = SSL_write(conn->ssl, data, len);
         ssl_flush_write_bio(conn);
 
         int result = 0;

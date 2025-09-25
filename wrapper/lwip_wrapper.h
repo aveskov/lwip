@@ -12,7 +12,7 @@ extern "C" {
 
     // Callback function types
     typedef void (*udp_send_callback_t)(uint8_t* data, int len);
-    typedef void (*tcp_send_complete_callback_t)(void);
+    typedef void (*send_complete_callback_t)(void);
 
     // Core LwIP functions
     void init_lwip_lock(void);
@@ -26,11 +26,12 @@ extern "C" {
         const char* netmask_str,
         const char* gw_str,
         udp_send_callback_t udp_cb,
-        tcp_send_complete_callback_t tcp_complete_cb);
+        send_complete_callback_t send_complete_cb);
 
-    int lwip_connect(const char* id, const char* dest_ip_str, int port, const char* message);
+    int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char* message);
+    int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8_t* data, int len);
     void lwip_close_connection(const char* id);
-    void lwip_process_packet(const char* id, uint8_t* data, int len);
+    void lwip_process_packet(const char* id, const uint8_t* data, int len);
 
     // Helper functions for SSL wrapper    
     connection_entry_t* find_connection(const char* id);

@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 typedef void (*ssl_handshake_complete_callback_t)(int success);
-typedef void (*ssl_data_received_callback_t)(const uint8_t* data, size_t len);
+typedef void (*ssl_data_received_callback_t)(const uint8_t* data, int len);
 typedef void (*ssl_send_complete_callback_t)(void);
 
 __declspec(dllexport) void lwip_ssl_init_global(void);
@@ -20,7 +20,7 @@ __declspec(dllexport) int lwip_ssl_connect(const char* id,
 	                 ssl_handshake_complete_callback_t handshake_complete_cb,
                      ssl_data_received_callback_t data_received_cb,
                      ssl_send_complete_callback_t ssl_complete_cb);
-__declspec(dllexport) int lwip_ssl_send_data(const char* id, const uint8_t* data, size_t len);
+__declspec(dllexport) int lwip_ssl_send_data(const char* id, const uint8_t* data, int len);
 __declspec(dllexport) void lwip_ssl_close_connection(const char* id);
 
 #ifdef __cplusplus
