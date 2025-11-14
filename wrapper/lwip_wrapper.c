@@ -548,7 +548,11 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
     pbuf_free(p);
 
     if (err_sendto != ERR_OK) {
-        printf("ERROR: UDP send failed: %d\n", err);
+        printf("ERROR: UDP send failed: %d\n", err_sendto);
+        udp_remove(conn->udp_pcb);
+        conn->udp_pcb = NULL;
+        lwip_unlock();
+        conn_unref(conn);
         return -1;
     }
 
