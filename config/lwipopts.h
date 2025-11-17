@@ -21,18 +21,30 @@ void* ip4_route_custom(const void* src_ip, const void* dest_ip);
 #define MEM_LIBC_MALLOC                 1
 #define MEMP_MEM_MALLOC                 1
 #define MEM_ALIGNMENT                   4
-#define MEM_SIZE                        1600
+#define MEM_SIZE                        16000    // Increased from 1600
+
+// TCP configuration
+#define TCP_MSS                         1460
+#define TCP_SND_BUF                     (4 * TCP_MSS)  // 5840 bytes
+#define TCP_SND_QUEUELEN                ((4 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))
+#define TCP_WND                         (4 * TCP_MSS)  // Same as SND_BUF
+#define PBUF_POOL_SIZE                  16
 
 // Optional: use system-provided struct timeval
 #define LWIP_TIMEVAL_PRIVATE            0
 
-// Stats & Debugging
+// Stats & Debugging - TEMPORARILY ENABLED to diagnose ERR_MEM
 #define LWIP_DEBUG                      0
+//#define LWIP_DBG_MIN_LEVEL              LWIP_DBG_LEVEL_ALL
+#define LWIP_DBG_TYPES_ON               LWIP_DBG_OFF
 #define TCP_DEBUG                       LWIP_DBG_OFF
-#define PBUF_DEBUG                      LWIP_DBG_OFF
+#define PBUF_DEBUG                      LWIP_DBG_OFF 
 #define MEM_DEBUG                       LWIP_DBG_OFF
 #define MEMP_DEBUG                      LWIP_DBG_OFF
 #define LWIP_STATS                      0
+#define MEM_STATS                       0
+#define MEMP_STATS                      0
+#define TCP_STATS                       0
 
 // No high-level APIs needed
 #define LWIP_NETCONN                    0

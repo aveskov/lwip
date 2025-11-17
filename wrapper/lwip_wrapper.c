@@ -162,7 +162,19 @@ static err_t on_tcp_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
         tcp_sent(tpcb, NULL);
         tcp_recv(tpcb, NULL);
         tcp_err(tpcb, NULL);
-        tcp_close(tpcb);
+        
+        // Check if netif is still up before closing
+        if (netif_is_up(&conn->netif)) {
+            err_t close_err = tcp_close(tpcb);
+            if (close_err != ERR_OK) {
+                // If close fails, abort the connection
+                printf("tcp_close failed: %d, aborting\n", close_err);
+                tcp_abort(tpcb);
+            }
+        } else {
+            // Netif is down, abort instead of close to avoid routing issues
+            tcp_abort(tpcb);
+        }
         conn->pcb = NULL;
     }
     lwip_unlock();
@@ -189,13 +201,31 @@ static err_t tcp_connected(void* arg, struct tcp_pcb* tpcb, err_t err) {
         }
         else {
             printf("tcp_write failed: %d\n", wr);
+            // Clean up on write failure
+            tcp_arg(tpcb, NULL);
+            tcp_sent(tpcb, NULL);
+            tcp_recv(tpcb, NULL);
+            tcp_err(tpcb, NULL);
+            tcp_abort(tpcb);
+            conn->pcb = NULL;
+            lwip_unlock();
             conn_unref(conn);
+            return ERR_ABRT;
         }
         free(conn->message);
         conn->message = NULL;
     }
     else {
-        conn_unref(conn);  // No message to send, release reference
+        // No message to send, close immediately
+        tcp_arg(tpcb, NULL);
+        tcp_sent(tpcb, NULL);
+        tcp_recv(tpcb, NULL);
+        tcp_err(tpcb, NULL);
+        tcp_close(tpcb);
+        conn->pcb = NULL;
+        lwip_unlock();
+        conn_unref(conn);
+        return ERR_OK;
     }
     lwip_unlock();
 
@@ -583,13 +613,13 @@ void lwip_close_connection(const char* id) {
             // Remove from list first
             *prev = conn->next;
 
-            // Cleanup network interface
-            netif_set_down(&conn->netif);
-            netif_remove(&conn->netif);
-
-            // Close TCP connection if active
+            // Close TCP connection if active - do this BEFORE removing netif
             if (conn->pcb) {
-                tcp_abort(conn->pcb);
+                tcp_arg(conn->pcb, NULL);
+                tcp_sent(conn->pcb, NULL);
+                tcp_recv(conn->pcb, NULL);
+                tcp_err(conn->pcb, NULL);
+                tcp_abort(conn->pcb);  // Use abort to avoid sending packets
                 conn->pcb = NULL;
             }
 
@@ -598,6 +628,10 @@ void lwip_close_connection(const char* id) {
                 udp_remove(conn->udp_pcb);
                 conn->udp_pcb = NULL;
             }
+
+            // Now cleanup network interface
+            netif_set_down(&conn->netif);
+            netif_remove(&conn->netif);
 
             lwip_unlock();
 
@@ -617,25 +651,22 @@ void lwip_close_connection(const char* id) {
 
 void* ip4_route_custom(const void* src, const void* dest) {
     if (!src) {
-        printf("ERROR: ip4_route_custom: source IP is empty\n");
         return NULL;
     }
 
-    ip4_addr_t* src_ip = (ip4_addr_t*)src;
+    const ip4_addr_t* src_ip4 = (const ip4_addr_t*)src;
 
     lwip_lock();
     connection_entry_t* conn = connection_list;
     while (conn) {
-        if (ip4_addr_cmp(&conn->src_ip, src_ip)) {
+        if (ip4_addr_cmp(&conn->src_ip, src_ip4)) {
             struct netif* result = &conn->netif;
-            lwip_unlock();
+            lwip_unlock();            
             return result;
         }
         conn = conn->next;
     }
     lwip_unlock();
-
-    printf("Netif is not found\n");
 
     return NULL;
 }
