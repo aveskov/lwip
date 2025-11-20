@@ -28,6 +28,7 @@ typedef struct connection_entry {
     send_complete_callback_t send_complete_callback;
     struct connection_entry* next;
     volatile int ref_count;  // Reference counting for safe cleanup
+    int persistent_mode;  // Flag for persistent TCP connections
 } connection_entry_t;
 
 static connection_entry_t* connection_list = NULL;
@@ -191,13 +192,27 @@ static err_t tcp_connected(void* arg, struct tcp_pcb* tpcb, err_t err) {
     }
 
     lwip_lock();
+    
+    // Disable Nagle's algorithm for reduced latency
+    tcp_nagle_disable(tpcb);
+    
     if (conn->message && strlen(conn->message) > 0) {
         err_t wr = tcp_write(tpcb, conn->message, strlen(conn->message), TCP_WRITE_FLAG_COPY);
         if (wr == ERR_OK) {
             tcp_output(tpcb);
-            tcp_sent(tpcb, on_tcp_sent);
-            tcp_arg(tpcb, conn);  // Keep reference for sent callback
-            conn_ref(conn);  // Add reference for sent callback
+            
+            if (!conn->persistent_mode) {
+                // Non-persistent mode: close after send
+                tcp_sent(tpcb, on_tcp_sent);
+                tcp_arg(tpcb, conn);
+                conn_ref(conn);  // Add reference for sent callback
+            } else {
+                // Persistent mode: trigger callback but keep connection open
+                tcp_sent(tpcb, NULL);
+                if (conn->send_complete_callback) {
+                    conn->send_complete_callback();
+                }
+            }
         }
         else {
             printf("tcp_write failed: %d\n", wr);
@@ -216,16 +231,19 @@ static err_t tcp_connected(void* arg, struct tcp_pcb* tpcb, err_t err) {
         conn->message = NULL;
     }
     else {
-        // No message to send, close immediately
-        tcp_arg(tpcb, NULL);
-        tcp_sent(tpcb, NULL);
-        tcp_recv(tpcb, NULL);
-        tcp_err(tpcb, NULL);
-        tcp_close(tpcb);
-        conn->pcb = NULL;
-        lwip_unlock();
-        conn_unref(conn);
-        return ERR_OK;
+        if (!conn->persistent_mode) {
+            // No message to send, close immediately
+            tcp_arg(tpcb, NULL);
+            tcp_sent(tpcb, NULL);
+            tcp_recv(tpcb, NULL);
+            tcp_err(tpcb, NULL);
+            tcp_close(tpcb);
+            conn->pcb = NULL;
+            lwip_unlock();
+            conn_unref(conn);
+            return ERR_OK;
+        }
+        // Persistent mode: keep connection open even with no initial message
     }
     lwip_unlock();
 
@@ -447,16 +465,23 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
     }
 
     conn->pcb->local_ip = conn->src_ip;
+    
+    // Disable Nagle's algorithm for reduced latency (optimization)
+    tcp_nagle_disable(conn->pcb);
 
     if (message) {
-        conn->message = _strdup(message);
-        if (!conn->message) {
-            tcp_abort(conn->pcb);
-            conn->pcb = NULL;
-            lwip_unlock();
-            printf("ERROR: Failed to duplicate message\n");
-            conn_unref(conn);
-            return -1;
+        // Use local buffer to avoid strdup overhead when possible
+        size_t msg_len = strlen(message);
+        if (msg_len > 0) {
+            conn->message = _strdup(message);
+            if (!conn->message) {
+                tcp_abort(conn->pcb);
+                conn->pcb = NULL;
+                lwip_unlock();
+                printf("ERROR: Failed to duplicate message\n");
+                conn_unref(conn);
+                return -1;
+            }
         }
     }
 
@@ -498,6 +523,188 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
 
     lwip_unlock();
     conn_unref(conn);  // Release find reference
+    return 0;
+}
+
+// New function: Create persistent TCP connection (avoids handshake overhead on each send)
+int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int port) {
+    if (!id || !dest_ip_str || port <= 0 || port > 65535) {
+        printf("ERROR: Invalid parameters for persistent connection\n");
+        return -1;
+    }
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return -1;
+
+    ip_addr_t dest_ip;
+    if (!ipaddr_aton(dest_ip_str, &dest_ip)) {
+        printf("ERROR: Invalid destination IP address\n");
+        conn_unref(conn);
+        return -1;
+    }
+
+    lwip_lock();
+
+    if (conn->pcb != NULL) {
+        printf("ERROR: Connection %s already active\n", id);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    conn->pcb = tcp_new();
+    if (!conn->pcb) {
+        lwip_unlock();
+        printf("Failed to allocate new PCB for connection %s\n", id);
+        conn_unref(conn);
+        return -1;
+    }
+
+    conn->pcb->local_ip = conn->src_ip;
+    conn->persistent_mode = 1;  // Enable persistent mode
+    
+    // Disable Nagle's algorithm for reduced latency
+    tcp_nagle_disable(conn->pcb);
+
+    err_t bind_result = tcp_bind(conn->pcb, &conn->pcb->local_ip, 0);
+    if (bind_result != ERR_OK) {
+        printf("ERROR: tcp_bind failed: %d\n", bind_result);
+        tcp_abort(conn->pcb);
+        conn->pcb = NULL;
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    tcp_arg(conn->pcb, conn);
+    tcp_recv(conn->pcb, tcp_recv_cb);
+    tcp_err(conn->pcb, on_tcp_error);
+
+    conn_ref(conn);  // Add reference for callbacks
+    err_t ret = tcp_connect(conn->pcb, &dest_ip, port, tcp_connected);
+
+    if (ret != ERR_OK) {
+        printf("ERROR: tcp_connect failed: %d\n", ret);
+        tcp_abort(conn->pcb);
+        conn->pcb = NULL;
+        conn->persistent_mode = 0;
+        lwip_unlock();
+        conn_unref(conn);
+        conn_unref(conn);
+        return -1;
+    }
+
+    lwip_unlock();
+    conn_unref(conn);
+    return 0;
+}
+
+// New function: Send data on persistent connection (no handshake overhead)
+int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
+    if (!id || !data || len <= 0) {
+        printf("ERROR: Invalid parameters for persistent send\n");
+        return -1;
+    }
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return -1;
+
+    lwip_lock();
+
+    if (!conn->pcb || !conn->persistent_mode) {
+        printf("ERROR: No persistent connection active for %s\n", id);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    // Check if there's enough buffer space before writing
+    u16_t available = tcp_sndbuf(conn->pcb);
+    if (available < len) {
+        printf("WARNING: TCP send buffer full (available: %d, need: %d). Try again later.\n", available, len);
+        lwip_unlock();
+        conn_unref(conn);
+        return -2;  // Return special code to indicate buffer full (caller should retry)
+    }
+
+    err_t wr = tcp_write(conn->pcb, data, len, TCP_WRITE_FLAG_COPY);
+    if (wr == ERR_OK) {
+        tcp_output(conn->pcb);
+        lwip_unlock();
+        
+        if (conn->send_complete_callback) {
+            conn->send_complete_callback();
+        }
+        
+        conn_unref(conn);
+        return 0;
+    }
+    else {
+        printf("tcp_write failed: %d\n", wr);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+}
+
+// Close persistent connection
+void lwip_tcp_disconnect_persistent(const char* id) {
+    if (!id) return;
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return;
+
+    lwip_lock();
+
+    if (conn->pcb && conn->persistent_mode) {
+        tcp_arg(conn->pcb, NULL);
+        tcp_sent(conn->pcb, NULL);
+        tcp_recv(conn->pcb, NULL);
+        tcp_err(conn->pcb, NULL);
+        
+        if (netif_is_up(&conn->netif)) {
+            err_t close_err = tcp_close(conn->pcb);
+            if (close_err != ERR_OK) {
+                printf("tcp_close failed: %d, aborting\n", close_err);
+                tcp_abort(conn->pcb);
+            }
+        } else {
+            tcp_abort(conn->pcb);
+        }
+        
+        conn->pcb = NULL;
+        conn->persistent_mode = 0;
+        conn_unref(conn);  // Release callback reference
+    }
+
+    lwip_unlock();
+    conn_unref(conn);
+}
+
+// Control Nagle's algorithm
+int lwip_tcp_set_nodelay(const char* id, int enable) {
+    if (!id) return -1;
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return -1;
+
+    lwip_lock();
+
+    if (!conn->pcb) {
+        printf("ERROR: No active TCP connection for %s\n", id);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    if (enable) {
+        tcp_nagle_disable(conn->pcb);
+    } else {
+        tcp_nagle_enable(conn->pcb);
+    }
+
+    lwip_unlock();
+    conn_unref(conn);
     return 0;
 }
 
@@ -672,7 +879,6 @@ void* ip4_route_custom(const void* src, const void* dest) {
 }
 
 
-// Cleanup function for graceful shutdown
 void lwip_cleanup_all_connections() {
     lwip_lock();
 

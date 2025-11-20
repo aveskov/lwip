@@ -28,7 +28,14 @@ extern "C" {
         udp_send_callback_t udp_cb,
         send_complete_callback_t send_complete_cb);
 
+    // TCP functions - optimized versions
     int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char* message);
+    int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int port);
+    int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len);
+    void lwip_tcp_disconnect_persistent(const char* id);
+    int lwip_tcp_set_nodelay(const char* id, int enable);  // Control Nagle's algorithm
+    int lwip_tcp_get_send_buffer_available(const char* id);  // Check available send buffer
+    
     int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8_t* data, int len);
     void lwip_close_connection(const char* id);
     void lwip_process_packet(const char* id, const uint8_t* data, int len);
