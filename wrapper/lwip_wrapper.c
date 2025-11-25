@@ -156,9 +156,9 @@ static err_t on_tcp_sent_persistent(void* arg, struct tcp_pcb* tpcb, u16_t len) 
     if (!conn) return ERR_ARG;
 
     // Call the send complete callback to notify application
-    if (conn->send_complete_callback) {
-        conn->send_complete_callback();
-    }
+//    if (conn->send_complete_callback) {
+//        conn->send_complete_callback();
+//    }
 
     // Don't close connection (persistent mode)
     // Buffer is now drained and available for next send
@@ -661,6 +661,9 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
         tcp_output(conn->pcb);
         lwip_unlock();
         
+        if (conn->send_complete_callback) {
+            conn->send_complete_callback();
+        }
         // DON'T call send_complete_callback here!
         // Let on_tcp_sent_persistent() call it when ACK arrives
         
