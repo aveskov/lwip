@@ -154,10 +154,15 @@ static void input_cb(connection_entry_t* conn, const uint8_t* data, int len) {
 static err_t on_tcp_sent_persistent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
     connection_entry_t* conn = (connection_entry_t*)arg;
     if (!conn) return ERR_ARG;
-    
-    // Just acknowledge - don't close connection (persistent mode)
-    // This allows buffer to drain and become available again
-    
+
+    // Call the send complete callback to notify application
+    if (conn->send_complete_callback) {
+        conn->send_complete_callback();
+    }
+
+    // Don't close connection (persistent mode)
+    // Buffer is now drained and available for next send
+
     return ERR_OK;
 }
 
@@ -644,21 +649,20 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
         return -2;
     }
     
-    if (available < len) {
+    if ((int)available < len) {
         lwip_unlock();
         conn_unref(conn);
         return -2;  // Return buffer full - caller should retry
     }
 
     // Buffer has enough space - proceed with write
-    err_t wr = tcp_write(conn->pcb, data, len, TCP_WRITE_FLAG_COPY);
+    err_t wr = tcp_write(conn->pcb, data, (u16_t)len, TCP_WRITE_FLAG_COPY);
     if (wr == ERR_OK) {
         tcp_output(conn->pcb);
         lwip_unlock();
         
-        if (conn->send_complete_callback) {
-            conn->send_complete_callback();
-        }
+        // DON'T call send_complete_callback here!
+        // Let on_tcp_sent_persistent() call it when ACK arrives
         
         conn_unref(conn);
         return 0;
