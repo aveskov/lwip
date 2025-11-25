@@ -149,6 +149,18 @@ static void input_cb(connection_entry_t* conn, const uint8_t* data, int len) {
     lwip_unlock();
 }
 
+
+// Sent callback for persistent connections - called when data is ACKed
+static err_t on_tcp_sent_persistent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
+    connection_entry_t* conn = (connection_entry_t*)arg;
+    if (!conn) return ERR_ARG;
+    
+    // Just acknowledge - don't close connection (persistent mode)
+    // This allows buffer to drain and become available again
+    
+    return ERR_OK;
+}
+
 static err_t on_tcp_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
     connection_entry_t* conn = (connection_entry_t*)arg;
     if (!conn) return ERR_ARG;    
@@ -185,7 +197,7 @@ static err_t on_tcp_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
 }
 
 static err_t tcp_connected(void* arg, struct tcp_pcb* tpcb, err_t err) {
-    connection_entry_t* conn = (connection_entry_t*)arg;
+    connection_entry_t* conn = (connection_entry_t*)arg;       
     if (!conn || err != ERR_OK) {
         if (conn) conn_unref(conn);
         return err;
@@ -193,6 +205,12 @@ static err_t tcp_connected(void* arg, struct tcp_pcb* tpcb, err_t err) {
 
     lwip_lock();
     
+    // Set sent callback BEFORE any sends
+    if (conn->persistent_mode) {
+        // Persistent mode: use callback that doesn't close connection
+        tcp_sent(tpcb, on_tcp_sent_persistent);
+    }
+        
     // Disable Nagle's algorithm for reduced latency
     tcp_nagle_disable(tpcb);
     
@@ -207,8 +225,7 @@ static err_t tcp_connected(void* arg, struct tcp_pcb* tpcb, err_t err) {
                 tcp_arg(tpcb, conn);
                 conn_ref(conn);  // Add reference for sent callback
             } else {
-                // Persistent mode: trigger callback but keep connection open
-                tcp_sent(tpcb, NULL);
+                // Persistent mode: callback already set above
                 if (conn->send_complete_callback) {
                     conn->send_complete_callback();
                 }
@@ -617,15 +634,23 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
         return -1;
     }
 
-    // Check if there's enough buffer space before writing
+    // IMPORTANT: Check if there's enough buffer space BEFORE writing
     u16_t available = tcp_sndbuf(conn->pcb);
-    if (available < len) {
-        printf("WARNING: TCP send buffer full (available: %d, need: %d). Try again later.\n", available, len);
+    if (available == 0) {
+        // Buffer completely full - caller MUST wait and retry
+        printf("WARNING: TCP send buffer full (0 bytes available). Caller should retry after lwip_poll().\n");
         lwip_unlock();
         conn_unref(conn);
-        return -2;  // Return special code to indicate buffer full (caller should retry)
+        return -2;
+    }
+    
+    if (available < len) {
+        lwip_unlock();
+        conn_unref(conn);
+        return -2;  // Return buffer full - caller should retry
     }
 
+    // Buffer has enough space - proceed with write
     err_t wr = tcp_write(conn->pcb, data, len, TCP_WRITE_FLAG_COPY);
     if (wr == ERR_OK) {
         tcp_output(conn->pcb);
@@ -638,11 +663,17 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
         conn_unref(conn);
         return 0;
     }
-    else {
-        printf("tcp_write failed: %d\n", wr);
+    else if (wr == ERR_MEM) {
         lwip_unlock();
         conn_unref(conn);
-        return -1;
+        return -2;  // Retry
+    }
+    else {
+        // Fatal error (not buffer related)
+        printf("ERROR: tcp_write failed with error: %d\n", wr);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;  // Fatal
     }
 }
 
@@ -705,6 +736,29 @@ int lwip_tcp_set_nodelay(const char* id, int enable) {
     lwip_unlock();
     conn_unref(conn);
     return 0;
+}
+
+// Get available send buffer space for persistent connection
+int lwip_tcp_get_send_buffer_available(const char* id) {
+    if (!id) return -1;
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return -1;
+
+    lwip_lock();
+
+    if (!conn->pcb || !conn->persistent_mode) {
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    u16_t available = tcp_sndbuf(conn->pcb);
+    
+    lwip_unlock();
+    conn_unref(conn);
+    
+    return (int)available;
 }
 
 int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8_t* data, int len) {
