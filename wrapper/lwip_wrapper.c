@@ -93,7 +93,7 @@ struct netif* get_connection_netif(connection_entry_t* conn) {
 }
 
 static err_t output_cb(struct netif* netif, struct pbuf* p, const ip4_addr_t* ipaddr) {
-    if (!netif || !netif->state || !p) {
+    if (!netif || !netif->state ||!p) {
         printf("ERROR: Invalid parameters in output_cb\n");
         return ERR_VAL;
     }
@@ -359,8 +359,7 @@ int lwip_create_connection(const char* id,
     }
 
     lwip_lock();
-
-    // Check if connection already exists
+   
     if (find_connection_locked(id)) {
         lwip_unlock();
         printf("ERROR: Connection '%s' already exists\n", id);
@@ -526,7 +525,7 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
     return 0;
 }
 
-// New function: Create persistent TCP connection (avoids handshake overhead on each send)
+// Create persistent TCP connection (avoids handshake overhead on each send)
 int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int port) {
     if (!id || !dest_ip_str || port <= 0 || port > 65535) {
         printf("ERROR: Invalid parameters for persistent connection\n");
@@ -599,7 +598,7 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
     return 0;
 }
 
-// New function: Send data on persistent connection (no handshake overhead)
+// Send data on persistent connection (no handshake overhead)
 int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
     if (!id || !data || len <= 0) {
         printf("ERROR: Invalid parameters for persistent send\n");
@@ -729,36 +728,31 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
 
     lwip_lock();
 
-    // Check if UDP is already bound
-    if (conn->udp_pcb != NULL) {
-        printf("ERROR: UDP already bound for connection '%s'\n", id);
-        lwip_unlock();
-        conn_unref(conn);
-        return -1;
-    }
+    // Reuse existing UDP PCB if available (optimization - like persistent connection)
+    if (conn->udp_pcb == NULL) {
+        // Create UDP PCB only once
+        conn->udp_pcb = udp_new();
+        if (!conn->udp_pcb) {
+            printf("ERROR: Failed to create UDP PCB for connection '%s'\n", id);
+            lwip_unlock();
+            conn_unref(conn);
+            return -1;
+        }
 
-    // Create new UDP PCB
-    conn->udp_pcb = udp_new();
-    if (!conn->udp_pcb) {
-        printf("ERROR: Failed to create UDP PCB for connection '%s'\n", id);
-        lwip_unlock();
-        conn_unref(conn);
-        return -1;
-    }
+        // Bind to local port
+        err_t err = udp_bind(conn->udp_pcb, &conn->src_ip, 0);
+        if (err != ERR_OK) {
+            printf("ERROR: UDP bind failed for connection '%s': %d\n", id, err);
+            udp_remove(conn->udp_pcb);
+            conn->udp_pcb = NULL;
+            lwip_unlock();
+            conn_unref(conn);
+            return -1;
+        }
 
-    // Bind to local port
-    err_t err = udp_bind(conn->udp_pcb, &conn->src_ip, 0);
-    if (err != ERR_OK) {
-        printf("ERROR: UDP bind failed for connection '%s': %d\n", id, err);
-        udp_remove(conn->udp_pcb);
-        conn->udp_pcb = NULL;
-        lwip_unlock();
-        conn_unref(conn);
-        return -1;
+        // Set receive callback
+        udp_recv(conn->udp_pcb, udp_recv_cb, conn);
     }
-
-    // Set receive callback    
-    udp_recv(conn->udp_pcb, udp_recv_cb, conn);
 
     // Allocate pbuf for the data
     struct pbuf* p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
@@ -778,7 +772,7 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
         return -1;
     }
 
-    // Send the packet
+    // Send the packet (reusing existing PCB)
     err_t err_sendto = udp_sendto(conn->udp_pcb, p, &dest_ip, port);
 
     // Cleanup pbuf
@@ -786,8 +780,6 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
 
     if (err_sendto != ERR_OK) {
         printf("ERROR: UDP send failed: %d\n", err_sendto);
-        udp_remove(conn->udp_pcb);
-        conn->udp_pcb = NULL;
         lwip_unlock();
         conn_unref(conn);
         return -1;
