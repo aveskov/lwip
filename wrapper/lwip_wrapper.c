@@ -359,6 +359,7 @@ connection_entry_t* find_connection(const char* id) {
     if (!conn) {
         printf("Connection '%s' not found.\n", id ? id : "NULL");
     }
+
     return conn;
 }
 
@@ -772,32 +773,40 @@ void lwip_tcp_disconnect_persistent(const char* id) {
     lwip_lock();
 
     if (conn->pcb && conn->persistent_mode) {
-        // Clear persistent_mode FIRST to prevent callbacks from firing
+        // Clear persistent_mode FIRST to prevent normal callbacks
         conn->persistent_mode = 0;
         
-        // Now clear all callbacks
+        // Clear non-error callbacks
         tcp_arg(conn->pcb, NULL);
         tcp_sent(conn->pcb, NULL);
         tcp_recv(conn->pcb, NULL);
-        tcp_err(conn->pcb, NULL);
+        
+        // Keep tcp_err callback so on_tcp_error can handle conn_unref
         
         if (netif_is_up(&conn->netif)) {
             err_t close_err = tcp_close(conn->pcb);
             if (close_err != ERR_OK) {
                 printf("tcp_close failed: %d, aborting\n", close_err);
-                tcp_abort(conn->pcb);
+                tcp_abort(conn->pcb);  // This will call on_tcp_error
+            } else {
+                // tcp_close succeeded - connection closed gracefully
+                // We need to manually release callback reference since no error callback
+                tcp_err(conn->pcb, NULL);  // Clear error callback now
+                conn_unref(conn);  // Release callback reference
             }
         } else {
-            tcp_abort(conn->pcb);
+            tcp_abort(conn->pcb);  // This will call on_tcp_error with ERR_ABRT
         }
         
         conn->pcb = NULL;
-        conn_unref(conn);  // Release callback reference
+        // Do NOT call conn_unref here if tcp_abort was called - on_tcp_error will handle it
+        // conn_unref is called above only if tcp_close succeeded
     }
 
     lwip_unlock();
-    conn_unref(conn);
+    conn_unref(conn);  // Release find_connection reference
 }
+
 
 // Control Nagle's algorithm
 int lwip_tcp_set_nodelay(const char* id, int enable) {
@@ -956,16 +965,22 @@ void lwip_close_connection(const char* id) {
 
             // Close TCP connection if active - do this BEFORE removing netif
             if (conn->pcb) {
-                // IMPORTANT: Clear persistent_mode FIRST to prevent callbacks from firing
+                // IMPORTANT: Clear persistent_mode FIRST to prevent normal callbacks
                 conn->persistent_mode = 0;
                 
-                // Now clear all callbacks
+                // Clear non-error callbacks
                 tcp_arg(conn->pcb, NULL);
                 tcp_sent(conn->pcb, NULL);
                 tcp_recv(conn->pcb, NULL);
-                tcp_err(conn->pcb, NULL);
-                tcp_abort(conn->pcb);  // Use abort to avoid sending packets
+                
+                // Keep tcp_err callback - tcp_abort() will call it with ERR_ABRT
+                // on_tcp_error will then call conn_unref() to release callback reference
+                // This ensures proper cleanup without use-after-free
+                
+                tcp_abort(conn->pcb);  // This calls on_tcp_error with ERR_ABRT
                 conn->pcb = NULL;
+                
+                // Do NOT call conn_unref here - on_tcp_error will handle it
             }
 
             // Close UDP connection if active
