@@ -357,7 +357,7 @@ connection_entry_t* find_connection(const char* id) {
     lwip_unlock();
 
     if (!conn) {
-        printf("Connection '%s' not found.\n", id ? id : "NULL");
+       printf("Connection '%s' not found.\n", id ? id : "NULL");
     }
 
     return conn;
@@ -773,7 +773,10 @@ void lwip_tcp_disconnect_persistent(const char* id) {
     lwip_lock();
 
     if (conn->pcb && conn->persistent_mode) {
-        // Clear persistent_mode FIRST to prevent normal callbacks
+        // CRITICAL: Clear callback FIRST to prevent use-after-free
+        conn->send_complete_callback = NULL;
+        
+        // Clear persistent_mode to prevent normal callbacks
         conn->persistent_mode = 0;
         
         // Clear non-error callbacks
@@ -806,7 +809,6 @@ void lwip_tcp_disconnect_persistent(const char* id) {
     lwip_unlock();
     conn_unref(conn);  // Release find_connection reference
 }
-
 
 // Control Nagle's algorithm
 int lwip_tcp_set_nodelay(const char* id, int enable) {
@@ -962,6 +964,11 @@ void lwip_close_connection(const char* id) {
         if (conn->id && strcmp(conn->id, id) == 0) {
             // Remove from list first
             *prev = conn->next;
+            
+            // CRITICAL: Clear all callbacks to prevent use-after-free
+            // This prevents C# code from calling back into freed memory
+            conn->send_complete_callback = NULL;
+            conn->udp_callback = NULL;
 
             // Close TCP connection if active - do this BEFORE removing netif
             if (conn->pcb) {
