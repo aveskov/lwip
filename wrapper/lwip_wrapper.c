@@ -153,15 +153,16 @@ static void input_cb(connection_entry_t* conn, const uint8_t* data, int len) {
 // Sent callback for persistent connections - called when data is ACKed
 static err_t on_tcp_sent_persistent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
     connection_entry_t* conn = (connection_entry_t*)arg;
+    
     if (!conn) return ERR_ARG;
 
-    // Call the send complete callback to notify application
-//    if (conn->send_complete_callback) {
-//        conn->send_complete_callback();
-//    }
-
-    // Don't close connection (persistent mode)
-    // Buffer is now drained and available for next send
+    // Note: Stale callbacks can occur when connection is closed but ACKs are still in flight
+    // This is safe - we simply return ERR_OK and LwIP handles cleanup
+    // The connection validation (conn->pcb == tpcb && conn->persistent_mode) would
+    // catch stale callbacks, but since we don't perform any actions here, it's not needed
+    
+    // We don't call send_complete_callback here - it's already called after tcp_write()
+    // This callback just confirms ACK arrived (for LwIP internal bookkeeping)
 
     return ERR_OK;
 }
@@ -314,6 +315,7 @@ static void on_tcp_error(void* arg, err_t err) {
             conn->message = NULL;
         }
         conn->pcb = NULL;  // PCB is already freed by LwIP on error
+        conn->persistent_mode = 0;  // Clear persistent mode flag
         lwip_unlock();
         conn_unref(conn);
     }
@@ -661,11 +663,11 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
         tcp_output(conn->pcb);
         lwip_unlock();
         
+        // Call callback immediately after successful write
+        // Client should use lwip_tcp_get_send_buffer_available() for flow control
         if (conn->send_complete_callback) {
             conn->send_complete_callback();
         }
-        // DON'T call send_complete_callback here!
-        // Let on_tcp_sent_persistent() call it when ACK arrives
         
         conn_unref(conn);
         return 0;
@@ -684,6 +686,82 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
     }
 }
 
+// Send large data on persistent connection by fragmenting into buffer-sized chunks
+// This handles messages larger than TCP_SND_BUF automatically
+int lwip_tcp_send_persistent_large(const char* id, const uint8_t* data, int len) {
+    if (!id || !data || len <= 0) {
+        printf("ERROR: Invalid parameters for persistent send\n");
+        return -1;
+    }
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return -1;
+
+    const uint8_t* current = data;
+    int remaining = len;
+    int total_sent = 0;
+
+    while (remaining > 0) {
+        lwip_lock();
+
+        if (!conn->pcb || !conn->persistent_mode) {
+            printf("ERROR: No persistent connection active for %s\n", id);
+            lwip_unlock();
+            conn_unref(conn);
+            return -1;
+        }
+
+        // Get available buffer space
+        u16_t available = tcp_sndbuf(conn->pcb);
+        
+        if (available == 0) {
+            // Buffer full - wait for it to drain
+            lwip_unlock();
+            
+            // Process pending ACKs to free buffer space
+            lwip_poll();
+            Sleep(10);  // Small delay to allow ACKs to arrive
+            continue;   // Retry
+        }
+
+        // Send as much as will fit in the buffer
+        int chunk_size = (remaining < (int)available) ? remaining : (int)available;
+        
+        err_t wr = tcp_write(conn->pcb, current, (u16_t)chunk_size, TCP_WRITE_FLAG_COPY);
+        
+        if (wr == ERR_OK) {
+            tcp_output(conn->pcb);
+            lwip_unlock();
+            
+            // Update progress
+            current += chunk_size;
+            remaining -= chunk_size;
+            total_sent += chunk_size;
+            
+            // Call callback for each chunk sent
+            if (conn->send_complete_callback) {
+                conn->send_complete_callback();
+            }
+        }
+        else if (wr == ERR_MEM) {
+            // Memory error - wait and retry
+            lwip_unlock();
+            lwip_poll();
+            Sleep(10);
+        }
+        else {
+            // Fatal error
+            printf("ERROR: tcp_write failed with error: %d\n", wr);
+            lwip_unlock();
+            conn_unref(conn);
+            return -1;
+        }
+    }
+
+    conn_unref(conn);
+    return 0;  // Success - all data sent
+}
+
 // Close persistent connection
 void lwip_tcp_disconnect_persistent(const char* id) {
     if (!id) return;
@@ -694,6 +772,10 @@ void lwip_tcp_disconnect_persistent(const char* id) {
     lwip_lock();
 
     if (conn->pcb && conn->persistent_mode) {
+        // Clear persistent_mode FIRST to prevent callbacks from firing
+        conn->persistent_mode = 0;
+        
+        // Now clear all callbacks
         tcp_arg(conn->pcb, NULL);
         tcp_sent(conn->pcb, NULL);
         tcp_recv(conn->pcb, NULL);
@@ -710,7 +792,6 @@ void lwip_tcp_disconnect_persistent(const char* id) {
         }
         
         conn->pcb = NULL;
-        conn->persistent_mode = 0;
         conn_unref(conn);  // Release callback reference
     }
 
@@ -875,6 +956,10 @@ void lwip_close_connection(const char* id) {
 
             // Close TCP connection if active - do this BEFORE removing netif
             if (conn->pcb) {
+                // IMPORTANT: Clear persistent_mode FIRST to prevent callbacks from firing
+                conn->persistent_mode = 0;
+                
+                // Now clear all callbacks
                 tcp_arg(conn->pcb, NULL);
                 tcp_sent(conn->pcb, NULL);
                 tcp_recv(conn->pcb, NULL);

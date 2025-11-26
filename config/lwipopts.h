@@ -25,7 +25,7 @@ void* ip4_route_custom(const void* src_ip, const void* dest_ip);
 
 // TCP configuration
 #define TCP_MSS                         1460
-#define TCP_SND_BUF                     (4 * TCP_MSS)  // 5840 bytes
+#define TCP_SND_BUF                     (8 * TCP_MSS)  // 11680 bytes
 #define TCP_SND_QUEUELEN                ((4 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))
 #define TCP_WND                         (4 * TCP_MSS)  // Same as SND_BUF
 #define PBUF_POOL_SIZE                  16

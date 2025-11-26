@@ -32,6 +32,7 @@ extern "C" {
     int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char* message);
     int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int port);
     int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len);
+    int lwip_tcp_send_persistent_large(const char* id, const uint8_t* data, int len);  // For messages > TCP_SND_BUF
     void lwip_tcp_disconnect_persistent(const char* id);
     int lwip_tcp_set_nodelay(const char* id, int enable);  // Control Nagle's algorithm
     int lwip_tcp_get_send_buffer_available(const char* id);  // Check available send buffer
