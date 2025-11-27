@@ -17,6 +17,13 @@
 
 #include "lwip_wrapper.h"
 
+// Message tracking structure for ACK callbacks
+typedef struct pending_ack_entry {
+    uint32_t message_id;                      // User-provided message identifier
+    u16_t bytes_sent;                         // Number of bytes in this message
+    struct pending_ack_entry* next;           // Next pending ACK
+} pending_ack_entry_t;
+
 typedef struct connection_entry {
     char* id;
     struct netif netif;
@@ -26,9 +33,14 @@ typedef struct connection_entry {
     char* message;
     udp_send_callback_t udp_callback;
     send_complete_callback_t send_complete_callback;
+    send_ack_complete_callback_t send_ack_complete_callback;  // New: ACK callback with message ID
     struct connection_entry* next;
     volatile int ref_count;  // Reference counting for safe cleanup
     int persistent_mode;  // Flag for persistent TCP connections
+    
+    // Message tracking for ACK callbacks
+    pending_ack_entry_t* pending_acks_head;   // Head of pending ACK queue
+    pending_ack_entry_t* pending_acks_tail;   // Tail of pending ACK queue
 } connection_entry_t;
 
 static connection_entry_t* connection_list = NULL;
@@ -156,13 +168,43 @@ static err_t on_tcp_sent_persistent(void* arg, struct tcp_pcb* tpcb, u16_t len) 
     
     if (!conn) return ERR_ARG;
 
-    // Note: Stale callbacks can occur when connection is closed but ACKs are still in flight
-    // This is safe - we simply return ERR_OK and LwIP handles cleanup
-    // The connection validation (conn->pcb == tpcb && conn->persistent_mode) would
-    // catch stale callbacks, but since we don't perform any actions here, it's not needed
+    // Process ACK queue to match ACKed bytes with message IDs
+    lwip_lock();
     
-    // We don't call send_complete_callback here - it's already called after tcp_write()
-    // This callback just confirms ACK arrived (for LwIP internal bookkeeping)
+    u16_t bytes_acked = len;
+    
+    while (bytes_acked > 0 && conn->pending_acks_head != NULL) {
+        pending_ack_entry_t* ack_entry = conn->pending_acks_head;
+        
+        if (bytes_acked >= ack_entry->bytes_sent) {
+            // This message is fully ACKed
+            bytes_acked -= ack_entry->bytes_sent;
+            
+            // Remove from queue
+            conn->pending_acks_head = ack_entry->next;
+            if (conn->pending_acks_head == NULL) {
+                conn->pending_acks_tail = NULL;
+            }
+            
+            uint32_t message_id = ack_entry->message_id;
+            send_ack_complete_callback_t callback = conn->send_ack_complete_callback;
+            
+            free(ack_entry);
+            
+            // Call ACK callback outside the lock
+            lwip_unlock();
+            if (callback) {
+                callback(message_id);
+            }
+            lwip_lock();
+        } else {
+            // Partial ACK - reduce bytes_sent in this entry
+            ack_entry->bytes_sent -= bytes_acked;
+            bytes_acked = 0;
+        }
+    }
+    
+    lwip_unlock();
 
     return ERR_OK;
 }
@@ -409,8 +451,11 @@ int lwip_create_connection(const char* id,
     conn->src_ip = src_ip;
     conn->udp_callback = udp_cb;
     conn->send_complete_callback = send_complete_cb;
+    conn->send_ack_complete_callback = NULL;  // Initialize ACK callback to NULL
     conn->netif.state = conn;
-    conn->ref_count = 1;  // Initial reference    
+    conn->ref_count = 1;  // Initial reference
+    conn->pending_acks_head = NULL;  // Initialize ACK queue
+    conn->pending_acks_tail = NULL;
 
     if (!netif_add(&conn->netif, &src_ip, &netmask, &gw, conn, netif_init_cb, netif_input)) {
         free(conn->id);
@@ -434,6 +479,20 @@ void lwip_poll() {
     lwip_lock();
     sys_check_timeouts();
     lwip_unlock();
+}
+
+// Set ACK callback for message ID tracking
+void lwip_set_ack_callback(const char* id, send_ack_complete_callback_t ack_cb) {
+    if (!id) return;
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return;
+
+    lwip_lock();
+    conn->send_ack_complete_callback = ack_cb;
+    lwip_unlock();
+
+    conn_unref(conn);
 }
 
 void lwip_init_stack_global() {
@@ -687,9 +746,8 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
     }
 }
 
-// Send large data on persistent connection by fragmenting into buffer-sized chunks
-// This handles messages larger than TCP_SND_BUF automatically
-int lwip_tcp_send_persistent_large(const char* id, const uint8_t* data, int len) {
+// Send data on persistent connection with message ID tracking for ACK callback
+int lwip_tcp_send_persistent_with_id(const char* id, const uint8_t* data, int len, uint32_t message_id) {
     if (!id || !data || len <= 0) {
         printf("ERROR: Invalid parameters for persistent send\n");
         return -1;
@@ -698,69 +756,82 @@ int lwip_tcp_send_persistent_large(const char* id, const uint8_t* data, int len)
     connection_entry_t* conn = find_connection(id);
     if (!conn) return -1;
 
-    const uint8_t* current = data;
-    int remaining = len;
-    int total_sent = 0;
+    lwip_lock();
 
-    while (remaining > 0) {
-        lwip_lock();
+    if (!conn->pcb || !conn->persistent_mode) {
+        printf("ERROR: No persistent connection active for %s\n", id);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
 
-        if (!conn->pcb || !conn->persistent_mode) {
-            printf("ERROR: No persistent connection active for %s\n", id);
+    // IMPORTANT: Check if there's enough buffer space BEFORE writing
+    u16_t available = tcp_sndbuf(conn->pcb);
+    if (available == 0) {
+        printf("WARNING: TCP send buffer full (0 bytes available). Caller should retry after lwip_poll().\n");
+        lwip_unlock();
+        conn_unref(conn);
+        return -2;
+    }
+    
+    if ((int)available < len) {
+        lwip_unlock();
+        conn_unref(conn);
+        return -2;  // Return buffer full - caller should retry
+    }
+
+    // Allocate ACK tracking entry
+    pending_ack_entry_t* ack_entry = (pending_ack_entry_t*)malloc(sizeof(pending_ack_entry_t));
+    if (!ack_entry) {
+        printf("ERROR: Failed to allocate ACK tracking entry\n");
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+    
+    ack_entry->message_id = message_id;
+    ack_entry->bytes_sent = (u16_t)len;
+    ack_entry->next = NULL;
+
+    // Buffer has enough space - proceed with write
+    err_t wr = tcp_write(conn->pcb, data, (u16_t)len, TCP_WRITE_FLAG_COPY);
+    if (wr == ERR_OK) {
+        // Add to pending ACK queue
+        if (conn->pending_acks_tail) {
+            conn->pending_acks_tail->next = ack_entry;
+        } else {
+            conn->pending_acks_head = ack_entry;
+        }
+        conn->pending_acks_tail = ack_entry;
+        
+        tcp_output(conn->pcb);
+        lwip_unlock();
+        
+        // Call send_complete callback (not ACK callback - that comes later in on_tcp_sent_persistent)
+        if (conn->send_complete_callback) {
+            conn->send_complete_callback();
+        }
+        
+        conn_unref(conn);
+        return 0;
+    }
+    else {
+        // Failed to send - free ACK entry
+        free(ack_entry);
+        
+        if (wr == ERR_MEM) {
             lwip_unlock();
             conn_unref(conn);
-            return -1;
-        }
-
-        // Get available buffer space
-        u16_t available = tcp_sndbuf(conn->pcb);
-        
-        if (available == 0) {
-            // Buffer full - wait for it to drain
-            lwip_unlock();
-            
-            // Process pending ACKs to free buffer space
-            lwip_poll();
-            Sleep(10);  // Small delay to allow ACKs to arrive
-            continue;   // Retry
-        }
-
-        // Send as much as will fit in the buffer
-        int chunk_size = (remaining < (int)available) ? remaining : (int)available;
-        
-        err_t wr = tcp_write(conn->pcb, current, (u16_t)chunk_size, TCP_WRITE_FLAG_COPY);
-        
-        if (wr == ERR_OK) {
-            tcp_output(conn->pcb);
-            lwip_unlock();
-            
-            // Update progress
-            current += chunk_size;
-            remaining -= chunk_size;
-            total_sent += chunk_size;
-            
-            // Call callback for each chunk sent
-            if (conn->send_complete_callback) {
-                conn->send_complete_callback();
-            }
-        }
-        else if (wr == ERR_MEM) {
-            // Memory error - wait and retry
-            lwip_unlock();
-            lwip_poll();
-            Sleep(10);
+            return -2;  // Retry
         }
         else {
-            // Fatal error
+            // Fatal error (not buffer related)
             printf("ERROR: tcp_write failed with error: %d\n", wr);
             lwip_unlock();
             conn_unref(conn);
-            return -1;
+            return -1;  // Fatal
         }
     }
-
-    conn_unref(conn);
-    return 0;  // Success - all data sent
 }
 
 // Close persistent connection
@@ -773,8 +844,17 @@ void lwip_tcp_disconnect_persistent(const char* id) {
     lwip_lock();
 
     if (conn->pcb && conn->persistent_mode) {
-        // CRITICAL: Clear callback FIRST to prevent use-after-free
+        // CRITICAL: Clear callbacks FIRST to prevent use-after-free
         conn->send_complete_callback = NULL;
+        conn->send_ack_complete_callback = NULL;
+        
+        // Clean up pending ACK queue
+        while (conn->pending_acks_head) {
+            pending_ack_entry_t* next = conn->pending_acks_head->next;
+            free(conn->pending_acks_head);
+            conn->pending_acks_head = next;
+        }
+        conn->pending_acks_tail = NULL;
         
         // Clear persistent_mode to prevent normal callbacks
         conn->persistent_mode = 0;
@@ -968,7 +1048,16 @@ void lwip_close_connection(const char* id) {
             // CRITICAL: Clear all callbacks to prevent use-after-free
             // This prevents C# code from calling back into freed memory
             conn->send_complete_callback = NULL;
+            conn->send_ack_complete_callback = NULL;
             conn->udp_callback = NULL;
+            
+            // Clean up pending ACK queue
+            while (conn->pending_acks_head) {
+                pending_ack_entry_t* next = conn->pending_acks_head->next;
+                free(conn->pending_acks_head);
+                conn->pending_acks_head = next;
+            }
+            conn->pending_acks_tail = NULL;
 
             // Close TCP connection if active - do this BEFORE removing netif
             if (conn->pcb) {
