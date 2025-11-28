@@ -19,7 +19,7 @@
 
 // Message tracking structure for ACK callbacks
 typedef struct pending_ack_entry {
-    uint32_t message_id;                      // User-provided message identifier
+    char* message_id;                         // User-provided message identifier (string)
     u16_t bytes_sent;                         // Number of bytes in this message
     struct pending_ack_entry* next;           // Next pending ACK
 } pending_ack_entry_t;
@@ -186,15 +186,21 @@ static err_t on_tcp_sent_persistent(void* arg, struct tcp_pcb* tpcb, u16_t len) 
                 conn->pending_acks_tail = NULL;
             }
             
-            uint32_t message_id = ack_entry->message_id;
+            // Copy message ID and callback before freeing entry
+            char* message_id = ack_entry->message_id;
             send_ack_complete_callback_t callback = conn->send_ack_complete_callback;
             
-            free(ack_entry);
+            // Don't free message_id yet - callback might need it
+            free(ack_entry);  // Free the entry structure
             
             // Call ACK callback outside the lock
             lwip_unlock();
-            if (callback) {
+            if (callback && message_id) {
                 callback(message_id);
+            }
+            // Now safe to free message ID
+            if (message_id) {
+                free(message_id);
             }
             lwip_lock();
         } else {
@@ -481,20 +487,6 @@ void lwip_poll() {
     lwip_unlock();
 }
 
-// Set ACK callback for message ID tracking
-void lwip_set_ack_callback(const char* id, send_ack_complete_callback_t ack_cb) {
-    if (!id) return;
-
-    connection_entry_t* conn = find_connection(id);
-    if (!conn) return;
-
-    lwip_lock();
-    conn->send_ack_complete_callback = ack_cb;
-    lwip_unlock();
-
-    conn_unref(conn);
-}
-
 void lwip_init_stack_global() {
     init_lwip_lock();
     lwip_init();
@@ -609,8 +601,8 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
     return 0;
 }
 
-// Create persistent TCP connection (avoids handshake overhead on each send)
-int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int port) {
+// Create persistent TCP connection (avoids handshake overhead)
+int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int port, send_ack_complete_callback_t ack_cb) {
     if (!id || !dest_ip_str || port <= 0 || port > 65535) {
         printf("ERROR: Invalid parameters for persistent connection\n");
         return -1;
@@ -646,6 +638,9 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
     conn->pcb->local_ip = conn->src_ip;
     conn->persistent_mode = 1;  // Enable persistent mode
     
+    // Set ACK callback for message tracking
+    conn->send_ack_complete_callback = ack_cb;
+    
     // Disable Nagle's algorithm for reduced latency
     tcp_nagle_disable(conn->pcb);
 
@@ -654,6 +649,7 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
         printf("ERROR: tcp_bind failed: %d\n", bind_result);
         tcp_abort(conn->pcb);
         conn->pcb = NULL;
+        conn->send_ack_complete_callback = NULL;
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -671,6 +667,7 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
         tcp_abort(conn->pcb);
         conn->pcb = NULL;
         conn->persistent_mode = 0;
+        conn->send_ack_complete_callback = NULL;
         lwip_unlock();
         conn_unref(conn);
         conn_unref(conn);
@@ -682,73 +679,10 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
     return 0;
 }
 
-// Send data on persistent connection (no handshake overhead)
-int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len) {
-    if (!id || !data || len <= 0) {
-        printf("ERROR: Invalid parameters for persistent send\n");
-        return -1;
-    }
-
-    connection_entry_t* conn = find_connection(id);
-    if (!conn) return -1;
-
-    lwip_lock();
-
-    if (!conn->pcb || !conn->persistent_mode) {
-        printf("ERROR: No persistent connection active for %s\n", id);
-        lwip_unlock();
-        conn_unref(conn);
-        return -1;
-    }
-
-    // IMPORTANT: Check if there's enough buffer space BEFORE writing
-    u16_t available = tcp_sndbuf(conn->pcb);
-    if (available == 0) {
-        // Buffer completely full - caller MUST wait and retry
-        printf("WARNING: TCP send buffer full (0 bytes available). Caller should retry after lwip_poll().\n");
-        lwip_unlock();
-        conn_unref(conn);
-        return -2;
-    }
-    
-    if ((int)available < len) {
-        lwip_unlock();
-        conn_unref(conn);
-        return -2;  // Return buffer full - caller should retry
-    }
-
-    // Buffer has enough space - proceed with write
-    err_t wr = tcp_write(conn->pcb, data, (u16_t)len, TCP_WRITE_FLAG_COPY);
-    if (wr == ERR_OK) {
-        tcp_output(conn->pcb);
-        lwip_unlock();
-        
-        // Call callback immediately after successful write
-        // Client should use lwip_tcp_get_send_buffer_available() for flow control
-        if (conn->send_complete_callback) {
-            conn->send_complete_callback();
-        }
-        
-        conn_unref(conn);
-        return 0;
-    }
-    else if (wr == ERR_MEM) {
-        lwip_unlock();
-        conn_unref(conn);
-        return -2;  // Retry
-    }
-    else {
-        // Fatal error (not buffer related)
-        printf("ERROR: tcp_write failed with error: %d\n", wr);
-        lwip_unlock();
-        conn_unref(conn);
-        return -1;  // Fatal
-    }
-}
-
-// Send data on persistent connection with message ID tracking for ACK callback
-int lwip_tcp_send_persistent_with_id(const char* id, const uint8_t* data, int len, uint32_t message_id) {
-    if (!id || !data || len <= 0) {
+// Send data on persistent connection with message ID tracking
+// Message ID is mandatory - use it to track ACK callbacks
+int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len, const char* message_id) {
+    if (!id || !data || len <= 0 || !message_id) {
         printf("ERROR: Invalid parameters for persistent send\n");
         return -1;
     }
@@ -789,7 +723,16 @@ int lwip_tcp_send_persistent_with_id(const char* id, const uint8_t* data, int le
         return -1;
     }
     
-    ack_entry->message_id = message_id;
+    // Duplicate message ID string
+    ack_entry->message_id = _strdup(message_id);
+    if (!ack_entry->message_id) {
+        printf("ERROR: Failed to duplicate message ID\n");
+        free(ack_entry);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+    
     ack_entry->bytes_sent = (u16_t)len;
     ack_entry->next = NULL;
 
@@ -816,7 +759,8 @@ int lwip_tcp_send_persistent_with_id(const char* id, const uint8_t* data, int le
         return 0;
     }
     else {
-        // Failed to send - free ACK entry
+        // Failed to send - free ACK entry and message ID
+        free(ack_entry->message_id);
         free(ack_entry);
         
         if (wr == ERR_MEM) {
@@ -848,9 +792,12 @@ void lwip_tcp_disconnect_persistent(const char* id) {
         conn->send_complete_callback = NULL;
         conn->send_ack_complete_callback = NULL;
         
-        // Clean up pending ACK queue
+        // Clean up pending ACK queue (including message ID strings)
         while (conn->pending_acks_head) {
             pending_ack_entry_t* next = conn->pending_acks_head->next;
+            if (conn->pending_acks_head->message_id) {
+                free(conn->pending_acks_head->message_id);
+            }
             free(conn->pending_acks_head);
             conn->pending_acks_head = next;
         }
@@ -1051,9 +998,12 @@ void lwip_close_connection(const char* id) {
             conn->send_ack_complete_callback = NULL;
             conn->udp_callback = NULL;
             
-            // Clean up pending ACK queue
+            // Clean up pending ACK queue (including message ID strings)
             while (conn->pending_acks_head) {
                 pending_ack_entry_t* next = conn->pending_acks_head->next;
+                if (conn->pending_acks_head->message_id) {
+                    free(conn->pending_acks_head->message_id);
+                }
                 free(conn->pending_acks_head);
                 conn->pending_acks_head = next;
             }

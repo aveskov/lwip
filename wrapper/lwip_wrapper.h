@@ -13,7 +13,7 @@ extern "C" {
     // Callback function types
     typedef void (*udp_send_callback_t)(uint8_t* data, int len);
     typedef void (*send_complete_callback_t)(void);
-    typedef void (*send_ack_complete_callback_t)(uint32_t message_id);  // New: Called when specific message is ACKed
+    typedef void (*send_ack_complete_callback_t)(const char* message_id);  // Called when specific message is ACKed
 
     // Core LwIP functions
     void init_lwip_lock(void);
@@ -28,16 +28,14 @@ extern "C" {
         const char* gw_str,
         udp_send_callback_t udp_cb,
         send_complete_callback_t send_complete_cb);
-    
-    // Set ACK callback for message tracking (optional, for advanced use cases)
-    void lwip_set_ack_callback(const char* id, send_ack_complete_callback_t ack_cb);
 
-    // TCP functions - optimized versions
     int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char* message);
-    int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int port);
-    int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len);
-    int lwip_tcp_send_persistent_with_id(const char* id, const uint8_t* data, int len, uint32_t message_id);  // New: Send with message ID tracking    
+    
+    // Persistent TCP connection with message ID tracking
+    int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int port, send_ack_complete_callback_t ack_cb);
+    int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len, const char* message_id);
     void lwip_tcp_disconnect_persistent(const char* id);
+    
     int lwip_tcp_set_nodelay(const char* id, int enable);  // Control Nagle's algorithm
     int lwip_tcp_get_send_buffer_available(const char* id);  // Check available send buffer
     
@@ -61,4 +59,4 @@ extern "C" {
 }
 #endif
 
-#endif // LWIP_WRAPPER_H
+#endif // LWIP_WRAPPER_H#endif // LWIP_WRAPPER_H
