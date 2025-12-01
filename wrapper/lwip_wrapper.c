@@ -1102,3 +1102,22 @@ void lwip_cleanup_all_connections() {
     lwip_unlock();
     cleanup_lwip_lock();
 }
+
+int lwip_tcp_get_pending_ack_count(const char* id) {
+    if (!id) return -1;
+    
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return -1;
+    
+    lwip_lock();
+    int count = 0;
+    pending_ack_entry_t* entry = conn->pending_acks_head;
+    while (entry) {
+        count++;
+        entry = entry->next;
+    }
+    lwip_unlock();
+    
+    conn_unref(conn);
+    return count;
+}

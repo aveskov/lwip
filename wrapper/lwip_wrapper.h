@@ -37,7 +37,8 @@ extern "C" {
     void lwip_tcp_disconnect_persistent(const char* id);
     
     int lwip_tcp_set_nodelay(const char* id, int enable);  // Control Nagle's algorithm
-    int lwip_tcp_get_send_buffer_available(const char* id);  // Check available send buffer
+    int lwip_tcp_get_send_buffer_available(const char* id);  // Check available send buffer    
+    int lwip_tcp_get_pending_ack_count(const char* id);
     
     int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8_t* data, int len);
     void lwip_close_connection(const char* id);
