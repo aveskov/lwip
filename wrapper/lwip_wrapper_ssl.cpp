@@ -31,6 +31,19 @@ extern "C" {
         SSL_STATE_ERROR
     } ssl_connection_state_t;
 
+    // SSL connection modes
+    typedef enum {
+        SSL_CONN_MODE_SINGLE_SEND,   // Close after one message (original behavior)
+        SSL_CONN_MODE_PERSISTENT     // Keep connection open for multiple sends
+    } ssl_connection_mode_t;
+
+    // Message tracking structure for ACK callbacks (similar to TCP)
+    typedef struct pending_ssl_ack_entry {
+        char* message_id;                         // User-provided message identifier
+        u16_t bytes_sent;                         // Number of bytes in this message (for TCP ACK tracking)
+        struct pending_ssl_ack_entry* next;       // Next pending ACK
+    } pending_ssl_ack_entry_t;
+
     typedef struct ssl_connection_entry {
         char* id;
         struct tcp_pcb* pcb;
@@ -44,11 +57,18 @@ extern "C" {
 
         char* hostname;
         ssl_connection_state_t state;
+        ssl_connection_mode_t mode;          // Connection mode (single/persistent)
+        int message_count;                   // Track messages sent on this connection
 
         // Callbacks
         ssl_handshake_complete_callback_t handshake_complete_callback;
         ssl_data_received_callback_t data_received_callback;
         ssl_send_complete_callback_t ssl_complete_callback;
+        ssl_send_ack_complete_callback_t ssl_ack_complete_callback;  // ACK callback with message ID
+
+        // Message tracking for ACK callbacks (persistent mode)
+        pending_ssl_ack_entry_t* pending_acks_head;   // Head of pending ACK queue
+        pending_ssl_ack_entry_t* pending_acks_tail;   // Tail of pending ACK queue
 
         struct ssl_connection_entry* next;
         volatile LONG ref_count;
@@ -77,6 +97,18 @@ extern "C" {
             if (conn->ssl_ctx) {
                 SSL_CTX_free(conn->ssl_ctx);
             }
+            
+            // Clean up pending ACK queue
+            while (conn->pending_acks_head) {
+                pending_ssl_ack_entry_t* next = conn->pending_acks_head->next;
+                if (conn->pending_acks_head->message_id) {
+                    free(conn->pending_acks_head->message_id);
+                }
+                free(conn->pending_acks_head);
+                conn->pending_acks_head = next;
+            }
+            conn->pending_acks_tail = NULL;
+            
             if (conn->id) free(conn->id);
             if (conn->hostname) free(conn->hostname);
             free(conn);
@@ -150,6 +182,59 @@ extern "C" {
 
             pending = BIO_pending(conn->wbio);
         }
+    }
+    
+    // TCP sent callback for SSL persistent connections - called when TCP ACKs data
+    static err_t ssl_tcp_sent_persistent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
+        ssl_connection_entry_t* conn = (ssl_connection_entry_t*)arg;
+        
+        if (!conn) return ERR_ARG;
+
+        // Process ACK queue to match ACKed bytes with message IDs
+        ssl_lock();
+        
+        u16_t bytes_acked = len;
+        
+        while (bytes_acked > 0 && conn->pending_acks_head != NULL) {
+            pending_ssl_ack_entry_t* ack_entry = conn->pending_acks_head;
+            
+            if (bytes_acked >= ack_entry->bytes_sent) {
+                // This message is fully ACKed
+                bytes_acked -= ack_entry->bytes_sent;
+                
+                // Remove from queue
+                conn->pending_acks_head = ack_entry->next;
+                if (conn->pending_acks_head == NULL) {
+                    conn->pending_acks_tail = NULL;
+                }
+                
+                // Copy message ID and callback before freeing entry
+                char* message_id = ack_entry->message_id;
+                ssl_send_ack_complete_callback_t callback = conn->ssl_ack_complete_callback;
+                
+                // Don't free message_id yet - callback might need it
+                free(ack_entry);  // Free the entry structure
+                
+                // Call ACK callback outside the lock
+                ssl_unlock();
+                if (callback && message_id) {
+                    callback(message_id);
+                }
+                // Now safe to free message ID
+                if (message_id) {
+                    free(message_id);
+                }
+                ssl_lock();
+            } else {
+                // Partial ACK - reduce bytes_sent in this entry
+                ack_entry->bytes_sent -= bytes_acked;
+                bytes_acked = 0;
+            }
+        }
+        
+        ssl_unlock();
+
+        return ERR_OK;
     }
 
     static void ssl_process_handshake(ssl_connection_entry_t* conn) {
@@ -285,6 +370,13 @@ extern "C" {
             return err;
         }        
 
+        // For persistent connections, set tcp_sent callback for ACK tracking
+        if (conn->mode == SSL_CONN_MODE_PERSISTENT) {
+            lwip_lock();
+            tcp_sent(tpcb, ssl_tcp_sent_persistent);
+            lwip_unlock();
+        }
+
         // Start SSL handshake
         conn->state = SSL_STATE_HANDSHAKING;
         ssl_process_handshake(conn);
@@ -384,6 +476,10 @@ extern "C" {
         ssl_conn->id = _strdup(id);
         ssl_conn->ref_count = 1;
         ssl_conn->state = SSL_STATE_CONNECTING;
+        ssl_conn->mode = SSL_CONN_MODE_SINGLE_SEND;  // Default mode
+        ssl_conn->message_count = 0;
+        ssl_conn->pending_acks_head = NULL;
+        ssl_conn->pending_acks_tail = NULL;
 
         ssl_conn->base_netif = get_connection_netif(base_conn);
 
@@ -550,7 +646,7 @@ extern "C" {
                     // Attempt a graceful TCP close
                     err_t err = tcp_close(conn->pcb);
                     if (err != ERR_OK) {
-                        // If tcp_close() fails (e.g. data unacked), you may want to wait/retry.
+                        // If tcp_close() fails (e.g. data unacknowledged), you may want to wait/retry.
                         // As a last resort, fall back to abort:
                         tcp_abort(conn->pcb);
                     }
@@ -569,4 +665,295 @@ extern "C" {
 
         ssl_unlock();
     }
-} // extern "C"
+
+    // ========== PERSISTENT SSL CONNECTION FUNCTIONS ==========
+
+    int lwip_ssl_connect_persistent(const char* id,
+        const char* dest_ip_str,
+        int port,
+        const char* hostname,
+        ssl_handshake_complete_callback_t handshake_complete_cb,
+        ssl_data_received_callback_t data_received_cb,
+        ssl_send_ack_complete_callback_t ack_cb) {
+
+        if (!id || !dest_ip_str || port <= 0 || port > 65535) {
+            printf("ERROR: Invalid parameters for persistent SSL connection\n");
+            return -1;
+        }
+
+        if (!ssl_initialized) {
+            printf("ERROR: SSL not initialized\n");
+            return -1;
+        }
+
+        // Find the base connection
+        connection_entry_t* base_conn = find_connection(id);
+        if (!base_conn) {
+            printf("ERROR: Base connection '%s' not found\n", id);
+            return -1;
+        }
+
+        ssl_lock();
+
+        // Check if SSL connection already exists
+        if (find_ssl_connection_locked(id)) {
+            ssl_unlock();
+            conn_unref(base_conn);
+            printf("ERROR: SSL connection '%s' already exists\n", id);
+            return -1;
+        }
+
+        // Create SSL connection entry
+        ssl_connection_entry_t* ssl_conn = (ssl_connection_entry_t*)calloc(1, sizeof(ssl_connection_entry_t));
+        if (!ssl_conn) {
+            ssl_unlock();
+            conn_unref(base_conn);
+            return -1;
+        }
+
+        ssl_conn->id = _strdup(id);
+        ssl_conn->ref_count = 1;
+        ssl_conn->state = SSL_STATE_CONNECTING;
+        ssl_conn->mode = SSL_CONN_MODE_PERSISTENT;  // Persistent mode
+        ssl_conn->message_count = 0;
+        ssl_conn->pending_acks_head = NULL;
+        ssl_conn->pending_acks_tail = NULL;
+
+        ssl_conn->base_netif = get_connection_netif(base_conn);
+
+        if (hostname) {
+            ssl_conn->hostname = _strdup(hostname);
+        }
+
+        // Set callbacks
+        ssl_conn->handshake_complete_callback = handshake_complete_cb;
+        ssl_conn->data_received_callback = data_received_cb;
+        ssl_conn->ssl_ack_complete_callback = ack_cb;
+       
+        // Create SSL objects
+        ssl_conn->ssl_ctx = create_ssl_ctx();
+        if (!ssl_conn->ssl_ctx) {
+            printf("ERROR: Failed to create per-connection SSL_CTX\n");
+            free(ssl_conn->id);
+            if (ssl_conn->hostname) free(ssl_conn->hostname);
+            free(ssl_conn);
+            ssl_unlock();
+            conn_unref(base_conn);
+            return -1;
+        }
+
+        ssl_conn->ssl = SSL_new(ssl_conn->ssl_ctx);
+        ssl_conn->rbio = BIO_new(BIO_s_mem());
+        ssl_conn->wbio = BIO_new(BIO_s_mem());
+
+        if (!ssl_conn->ssl || !ssl_conn->rbio || !ssl_conn->wbio) {
+            // Cleanup on failure
+            if (ssl_conn->ssl) SSL_free(ssl_conn->ssl);
+            if (ssl_conn->rbio) BIO_free(ssl_conn->rbio);
+            if (ssl_conn->wbio) BIO_free(ssl_conn->wbio);
+            SSL_CTX_free(ssl_conn->ssl_ctx);
+            free(ssl_conn->id);
+            if (ssl_conn->hostname) free(ssl_conn->hostname);
+            free(ssl_conn);
+            ssl_unlock();
+            conn_unref(base_conn);
+            return -1;
+        }
+
+        SSL_set_bio(ssl_conn->ssl, ssl_conn->rbio, ssl_conn->wbio);
+        SSL_set_connect_state(ssl_conn->ssl);
+
+        if (hostname) {
+            SSL_set_tlsext_host_name(ssl_conn->ssl, hostname);
+        }
+
+        // Add to SSL connection list
+        ssl_conn->next = ssl_connection_list;
+        ssl_connection_list = ssl_conn;
+
+        ssl_unlock();
+        conn_unref(base_conn);
+
+        // Create TCP connection
+        ip_addr_t dest_ip;
+        if (!ipaddr_aton(dest_ip_str, &dest_ip)) {
+            lwip_ssl_disconnect_persistent(id);
+            return -1;
+        }
+
+        lwip_lock();
+        ssl_conn->pcb = tcp_new();
+        if (!ssl_conn->pcb) {
+            lwip_unlock();
+            lwip_ssl_disconnect_persistent(id);
+            return -1;
+        }		
+        
+        const ip_addr_t* src_ip_ptr = get_connection_src_ip(base_conn);
+        if (!src_ip_ptr) {
+            lwip_unlock();
+            lwip_ssl_disconnect_persistent(id);
+            conn_unref(base_conn);
+            return -1;
+        }
+
+        ssl_conn->pcb->local_ip = *src_ip_ptr;
+
+        err_t bind_result = tcp_bind(ssl_conn->pcb, src_ip_ptr, 0);
+        if (bind_result != ERR_OK) {
+            tcp_abort(ssl_conn->pcb);
+            ssl_conn->pcb = NULL;
+            lwip_unlock();
+            lwip_ssl_disconnect_persistent(id);
+            return -1;
+        }
+
+        tcp_bind_netif(ssl_conn->pcb, ssl_conn->base_netif);
+
+        tcp_arg(ssl_conn->pcb, ssl_conn);
+        tcp_recv(ssl_conn->pcb, ssl_tcp_recv_cb);
+        tcp_err(ssl_conn->pcb, ssl_tcp_err_cb);
+
+        ssl_conn_ref(ssl_conn);
+        err_t connect_result = tcp_connect(ssl_conn->pcb, &dest_ip, port, ssl_tcp_connected_cb);
+
+        lwip_unlock();
+
+        if (connect_result != ERR_OK) {
+            ssl_conn_unref(ssl_conn);
+            lwip_ssl_disconnect_persistent(id);
+            return -1;
+        }
+
+        printf("Persistent SSL connection '%s' initiated\n", id);
+        return 0;
+    }
+
+    int lwip_ssl_send_persistent(const char* id, const uint8_t* data, int len, const char* message_id) {
+        if (!message_id) {
+            printf("ERROR: message_id is required for persistent SSL send\n");
+            return -1;
+        }
+
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) {
+            printf("ERROR: SSL connection '%s' not found\n", id);
+            return -1;
+        }
+
+        // Check if connection is in correct state
+        if (conn->state != SSL_STATE_CONNECTED) {
+            printf("ERROR: SSL connection '%s' not ready (state=%d)\n", 
+                   id, conn->state);
+            ssl_conn_unref(conn);
+            return -1;
+        }
+
+        // Check if it's a persistent connection
+        if (conn->mode != SSL_CONN_MODE_PERSISTENT) {
+            printf("ERROR: SSL connection '%s' is not persistent\n", id);
+            ssl_conn_unref(conn);
+            return -1;
+        }
+
+        // Send data via SSL (this may produce multiple TCP segments)
+        int bytes_written = SSL_write(conn->ssl, data, len);
+        
+        if (bytes_written > 0) {
+            // Calculate how many TCP bytes will actually be sent (including SSL overhead)
+            int bio_pending = BIO_pending(conn->wbio);
+            
+            if (bio_pending > 0) {
+                // Allocate ACK tracking entry
+                pending_ssl_ack_entry_t* ack_entry = (pending_ssl_ack_entry_t*)malloc(sizeof(pending_ssl_ack_entry_t));
+                if (!ack_entry) {
+                    printf("ERROR: Failed to allocate ACK tracking entry\n");
+                    ssl_conn_unref(conn);
+                    return -1;
+                }
+                
+                // Duplicate message ID string
+                ack_entry->message_id = _strdup(message_id);
+                if (!ack_entry->message_id) {
+                    printf("ERROR: Failed to duplicate message ID\n");
+                    free(ack_entry);
+                    ssl_conn_unref(conn);
+                    return -1;
+                }
+                
+                // Track the ACTUAL TCP bytes to be sent (SSL overhead included)
+                ack_entry->bytes_sent = (u16_t)bio_pending;
+                ack_entry->next = NULL;
+                
+                // Add to pending ACK queue BEFORE flushing
+                if (conn->pending_acks_tail) {
+                    conn->pending_acks_tail->next = ack_entry;
+                } else {
+                    conn->pending_acks_head = ack_entry;
+                }
+                conn->pending_acks_tail = ack_entry;
+            }
+            
+            conn->message_count++;
+            
+            // Flush write buffer - this sends TCP packets
+            // ACK callback will be triggered later by tcp_sent callback when TCP ACKs arrive
+            ssl_flush_write_bio(conn);
+            
+            ssl_conn_unref(conn);
+            return 0;
+        } else {
+            int ssl_error = SSL_get_error(conn->ssl, bytes_written);
+            if (ssl_error != SSL_ERROR_WANT_WRITE && ssl_error != SSL_ERROR_WANT_READ) {
+                ssl_handle_error(conn, "write");
+                ssl_conn_unref(conn);
+                return -1;
+            }
+            
+            ssl_conn_unref(conn);
+            return -2;  // Retry later
+        }
+    }
+
+    void lwip_ssl_disconnect_persistent(const char* id) {
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) {
+            printf("SSL connection '%s' not found for disconnect\n", id);
+            return;
+        }
+
+        printf("Closing persistent SSL connection '%s' (sent %d messages)\n", 
+               id, conn->message_count);
+        
+        ssl_conn_unref(conn);
+        lwip_ssl_close_connection(id);
+    }
+
+    int lwip_ssl_is_connected(const char* id) {
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) return 0;
+        
+        int connected = (conn->state == SSL_STATE_CONNECTED);
+        ssl_conn_unref(conn);
+        return connected;
+    }
+
+    int lwip_ssl_get_pending_ack_count(const char* id) {
+        if (!id) return -1;
+        
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) return -1;
+        
+        ssl_lock();
+        int count = 0;
+        pending_ssl_ack_entry_t* entry = conn->pending_acks_head;
+        while (entry) {
+            count++;
+            entry = entry->next;
+        }
+        ssl_unlock();
+        
+        ssl_conn_unref(conn);
+        return count;
+    }
+}
