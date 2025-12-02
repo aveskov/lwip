@@ -666,8 +666,6 @@ extern "C" {
         ssl_unlock();
     }
 
-    // ========== PERSISTENT SSL CONNECTION FUNCTIONS ==========
-
     int lwip_ssl_connect_persistent(const char* id,
         const char* dest_ip_str,
         int port,
@@ -936,6 +934,41 @@ extern "C" {
         int connected = (conn->state == SSL_STATE_CONNECTED);
         ssl_conn_unref(conn);
         return connected;
+    }
+
+    int lwip_ssl_get_send_buffer_available(const char* id) {
+        if (!id) return -1;
+        
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) return -1;
+        
+        // Check if connection is in correct state
+        if (conn->state != SSL_STATE_CONNECTED) {
+            ssl_conn_unref(conn);
+            return -1;
+        }
+        
+        // Check if it's a persistent connection
+        if (conn->mode != SSL_CONN_MODE_PERSISTENT) {
+            ssl_conn_unref(conn);
+            return -1;
+        }
+        
+        // Get TCP send buffer availability from underlying TCP connection
+        lwip_lock();
+        
+        if (!conn->pcb) {
+            lwip_unlock();
+            ssl_conn_unref(conn);
+            return -1;
+        }
+        
+        u16_t available = tcp_sndbuf(conn->pcb);
+        
+        lwip_unlock();
+        
+        ssl_conn_unref(conn);
+        return (int)available;
     }
 
     int lwip_ssl_get_pending_ack_count(const char* id) {

@@ -38,8 +38,8 @@ __declspec(dllexport) int lwip_ssl_connect_persistent(const char* id,
 __declspec(dllexport) int lwip_ssl_send_persistent(const char* id, const uint8_t* data, int len, const char* message_id);
 __declspec(dllexport) void lwip_ssl_disconnect_persistent(const char* id);
 
-// Helper function to check if SSL connection is ready
 __declspec(dllexport) int lwip_ssl_is_connected(const char* id);
+__declspec(dllexport) int lwip_ssl_get_send_buffer_available(const char* id);
 
 // Diagnostic functions for ACK queue monitoring
 __declspec(dllexport) int lwip_ssl_get_pending_ack_count(const char* id);
