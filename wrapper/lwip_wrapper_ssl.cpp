@@ -63,8 +63,8 @@ extern "C" {
         // Callbacks
         ssl_handshake_complete_callback_t handshake_complete_callback;
         ssl_data_received_callback_t data_received_callback;
-        ssl_send_complete_callback_t ssl_complete_callback;
-        ssl_send_ack_complete_callback_t ssl_ack_complete_callback;  // ACK callback with message ID
+        ssl_send_complete_callback_t ssl_send_complete_callback;  // Called immediately when SSL_write succeeds
+        ssl_send_ack_complete_callback_t ssl_ack_complete_callback;  // Called later when TCP ACKs message
 
         // Message tracking for ACK callbacks (persistent mode)
         pending_ssl_ack_entry_t* pending_acks_head;   // Head of pending ACK queue
@@ -436,7 +436,7 @@ extern "C" {
         const char* hostname,
         ssl_handshake_complete_callback_t handshake_complete_cb,
         ssl_data_received_callback_t data_received_cb,
-        ssl_send_complete_callback_t ssl_complete_cb) {
+        ssl_send_complete_callback_t send_complete_cb) {
 
         if (!id || !dest_ip_str || port <= 0 || port > 65535) {
             printf("ERROR: Invalid parameters for SSL connection\n");
@@ -490,7 +490,7 @@ extern "C" {
         // Set callbacks
         ssl_conn->handshake_complete_callback = handshake_complete_cb;
         ssl_conn->data_received_callback = data_received_cb;
-        ssl_conn->ssl_complete_callback = ssl_complete_cb;
+        ssl_conn->ssl_send_complete_callback = send_complete_cb;  // Optional: can be NULL
        
         // Create SSL objects
         ssl_conn->ssl_ctx = create_ssl_ctx();
@@ -603,9 +603,12 @@ extern "C" {
 
         int result = 0;
         if (bytes_written > 0) {
-            if (conn->ssl_complete_callback) {
-                conn->ssl_complete_callback();
+            // Data sent successfully
+            // Call send_complete callback if provided (optional)
+            if (conn->ssl_send_complete_callback) {
+                conn->ssl_send_complete_callback();
             }
+            result = 0;
         }
         else {
             int ssl_error = SSL_get_error(conn->ssl, bytes_written);
@@ -672,6 +675,7 @@ extern "C" {
         const char* hostname,
         ssl_handshake_complete_callback_t handshake_complete_cb,
         ssl_data_received_callback_t data_received_cb,
+        ssl_send_complete_callback_t send_complete_cb,
         ssl_send_ack_complete_callback_t ack_cb) {
 
         if (!id || !dest_ip_str || port <= 0 || port > 65535) {
@@ -726,7 +730,8 @@ extern "C" {
         // Set callbacks
         ssl_conn->handshake_complete_callback = handshake_complete_cb;
         ssl_conn->data_received_callback = data_received_cb;
-        ssl_conn->ssl_ack_complete_callback = ack_cb;
+        ssl_conn->ssl_send_complete_callback = send_complete_cb;  // Immediate callback
+        ssl_conn->ssl_ack_complete_callback = ack_cb;              // ACK callback
        
         // Create SSL objects
         ssl_conn->ssl_ctx = create_ssl_ctx();
@@ -895,8 +900,14 @@ extern "C" {
             conn->message_count++;
             
             // Flush write buffer - this sends TCP packets
-            // ACK callback will be triggered later by tcp_sent callback when TCP ACKs arrive
             ssl_flush_write_bio(conn);
+            
+            // IMPORTANT: Call send_complete callback IMMEDIATELY after successful send
+            // This allows application to queue next message without waiting for ACK
+            // ACK callback will be called later when TCP confirms delivery
+            if (conn->ssl_send_complete_callback) {
+                conn->ssl_send_complete_callback();
+            }
             
             ssl_conn_unref(conn);
             return 0;

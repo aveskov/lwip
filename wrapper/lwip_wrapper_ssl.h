@@ -9,21 +9,22 @@ extern "C" {
 
 typedef void (*ssl_handshake_complete_callback_t)(int success);
 typedef void (*ssl_data_received_callback_t)(const uint8_t* data, int len);
-typedef void (*ssl_send_complete_callback_t)(void);
-typedef void (*ssl_send_ack_complete_callback_t)(const char* message_id);  // Called when specific message is sent
+typedef void (*ssl_send_complete_callback_t)(void);  // Called immediately when SSL_write succeeds
+typedef void (*ssl_send_ack_complete_callback_t)(const char* message_id);  // Called later when TCP ACKs message
 
 // Global initialization
 __declspec(dllexport) void lwip_ssl_init_global(void);
 __declspec(dllexport) void lwip_ssl_cleanup_global(void);
 
 // Non-persistent SSL connection (single send, then close)
+// NOTE: send_complete_cb is optional (can be NULL) - called after SSL_write succeeds
 __declspec(dllexport) int lwip_ssl_connect(const char* id,
                      const char* dest_ip_str, 
                      int port,
                      const char* hostname,     
 	                 ssl_handshake_complete_callback_t handshake_complete_cb,
                      ssl_data_received_callback_t data_received_cb,
-                     ssl_send_complete_callback_t ssl_complete_cb);
+                     ssl_send_complete_callback_t send_complete_cb);  // Optional: can be NULL
 __declspec(dllexport) int lwip_ssl_send_data(const char* id, const uint8_t* data, int len);
 __declspec(dllexport) void lwip_ssl_close_connection(const char* id);
 
@@ -34,7 +35,8 @@ __declspec(dllexport) int lwip_ssl_connect_persistent(const char* id,
                      const char* hostname,
                      ssl_handshake_complete_callback_t handshake_complete_cb,
                      ssl_data_received_callback_t data_received_cb,
-                     ssl_send_ack_complete_callback_t ack_cb);
+                     ssl_send_complete_callback_t send_complete_cb,  // Immediate feedback
+                     ssl_send_ack_complete_callback_t ack_cb);       // ACK confirmation
 __declspec(dllexport) int lwip_ssl_send_persistent(const char* id, const uint8_t* data, int len, const char* message_id);
 __declspec(dllexport) void lwip_ssl_disconnect_persistent(const char* id);
 
