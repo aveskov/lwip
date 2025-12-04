@@ -86,6 +86,20 @@ void conn_unref(connection_entry_t* conn) {
         // Safe to cleanup
         if (conn->id) free(conn->id);
         if (conn->message) free(conn->message);
+        
+        // Clean up pending ACK queue to prevent memory leaks
+        // This can happen when connection is freed via error callbacks
+        // or lwip_cleanup_all_connections() before ACKs are received
+        while (conn->pending_acks_head) {
+            pending_ack_entry_t* next = conn->pending_acks_head->next;
+            if (conn->pending_acks_head->message_id) {
+                free(conn->pending_acks_head->message_id);
+            }
+            free(conn->pending_acks_head);
+            conn->pending_acks_head = next;
+        }
+        conn->pending_acks_tail = NULL;
+        
         free(conn);
     }
 }

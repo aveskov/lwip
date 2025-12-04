@@ -513,6 +513,7 @@ extern "C" {
             if (ssl_conn->ssl) SSL_free(ssl_conn->ssl);
             if (ssl_conn->rbio) BIO_free(ssl_conn->rbio);
             if (ssl_conn->wbio) BIO_free(ssl_conn->wbio);
+            if (ssl_conn->ssl_ctx) SSL_CTX_free(ssl_conn->ssl_ctx);  // FIX: Free SSL_CTX
             free(ssl_conn->id);
             if (ssl_conn->hostname) free(ssl_conn->hostname);
             free(ssl_conn);
@@ -866,6 +867,7 @@ extern "C" {
             // Calculate how many TCP bytes will actually be sent (including SSL overhead)
             int bio_pending = BIO_pending(conn->wbio);
             
+            // Only create ACK tracking if there's data to send over TCP
             if (bio_pending > 0) {
                 // Allocate ACK tracking entry
                 pending_ssl_ack_entry_t* ack_entry = (pending_ssl_ack_entry_t*)malloc(sizeof(pending_ssl_ack_entry_t));
@@ -879,7 +881,7 @@ extern "C" {
                 ack_entry->message_id = _strdup(message_id);
                 if (!ack_entry->message_id) {
                     printf("ERROR: Failed to duplicate message ID\n");
-                    free(ack_entry);
+                    free(ack_entry);  // Free the entry structure
                     ssl_conn_unref(conn);
                     return -1;
                 }
@@ -888,6 +890,9 @@ extern "C" {
                 ack_entry->bytes_sent = (u16_t)bio_pending;
                 ack_entry->next = NULL;
                 
+                // CRITICAL: Lock before modifying ACK queue to prevent race conditions
+                ssl_lock();
+                
                 // Add to pending ACK queue BEFORE flushing
                 if (conn->pending_acks_tail) {
                     conn->pending_acks_tail->next = ack_entry;
@@ -895,6 +900,8 @@ extern "C" {
                     conn->pending_acks_head = ack_entry;
                 }
                 conn->pending_acks_tail = ack_entry;
+                
+                ssl_unlock();
             }
             
             conn->message_count++;
