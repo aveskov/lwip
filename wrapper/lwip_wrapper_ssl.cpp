@@ -219,6 +219,7 @@ extern "C" {
                 // Call ACK callback outside the lock
                 ssl_unlock();
                 if (callback && message_id) {
+                    printf("ACK callback is called\n");
                     callback(message_id);
                 }
                 // Now safe to free message ID
@@ -926,7 +927,7 @@ extern "C" {
                 conn->pending_acks_tail = ack_entry;
                 
                 ssl_unlock();
-                
+
                 printf("DEBUG SSL ACK: Created ACK entry for msg=%s with %d bytes\n", message_id, actual_tcp_bytes);
             } else {
                 printf("DEBUG SSL ACK: No TCP bytes sent for msg=%s (buffered in BIO)\n", message_id);
