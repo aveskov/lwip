@@ -190,17 +190,25 @@ extern "C" {
         
         if (!conn) return ERR_ARG;
 
+        // DEBUGGING: Log ACK arrival
+        printf("DEBUG SSL ACK CALLBACK: TCP ACKed %d bytes, processing queue...\n", len);
+
         // Process ACK queue to match ACKed bytes with message IDs
         ssl_lock();
         
         u16_t bytes_acked = len;
+        int messages_processed = 0;
         
         while (bytes_acked > 0 && conn->pending_acks_head != NULL) {
             pending_ssl_ack_entry_t* ack_entry = conn->pending_acks_head;
             
+            printf("DEBUG SSL ACK CALLBACK: Processing entry msg_id=%s bytes=%d, remaining_acked=%d\n",
+                   ack_entry->message_id, ack_entry->bytes_sent, bytes_acked);
+            
             if (bytes_acked >= ack_entry->bytes_sent) {
                 // This message is fully ACKed
                 bytes_acked -= ack_entry->bytes_sent;
+                messages_processed++;
                 
                 // Remove from queue
                 conn->pending_acks_head = ack_entry->next;
@@ -215,6 +223,8 @@ extern "C" {
                 // Don't free message_id yet - callback might need it
                 free(ack_entry);  // Free the entry structure
                 
+                printf("DEBUG SSL ACK CALLBACK: Calling ACK callback for msg_id=%s\n", message_id);
+                
                 // Call ACK callback outside the lock
                 ssl_unlock();
                 if (callback && message_id) {
@@ -227,10 +237,14 @@ extern "C" {
                 ssl_lock();
             } else {
                 // Partial ACK - reduce bytes_sent in this entry
+                printf("DEBUG SSL ACK CALLBACK: Partial ACK - reducing entry bytes from %d to %d\n",
+                       ack_entry->bytes_sent, ack_entry->bytes_sent - bytes_acked);
                 ack_entry->bytes_sent -= bytes_acked;
                 bytes_acked = 0;
             }
         }
+        
+        printf("DEBUG SSL ACK CALLBACK: Processed %d messages from this TCP ACK\n", messages_processed);
         
         ssl_unlock();
 
