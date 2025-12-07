@@ -379,6 +379,12 @@ extern "C" {
         if (conn->mode == SSL_CONN_MODE_PERSISTENT) {
             lwip_lock();
             tcp_sent(tpcb, ssl_tcp_sent_persistent);
+            
+            // Disable Nagle's algorithm to ensure immediate transmission and ACKs
+            // This prevents TCP from batching data and ACKs, ensuring we get
+            // one ACK callback per message sent
+            tcp_nagle_disable(tpcb);
+            
             lwip_unlock();
         }
 
