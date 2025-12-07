@@ -864,11 +864,23 @@ extern "C" {
         int bytes_written = SSL_write(conn->ssl, data, len);
         
         if (bytes_written > 0) {
-            // Calculate how many TCP bytes will actually be sent (including SSL overhead)
-            int bio_pending = BIO_pending(conn->wbio);
+            // FIX: Measure BIO bytes BEFORE flush
+            int bio_bytes_before = BIO_pending(conn->wbio);
             
-            // Only create ACK tracking if there's data to send over TCP
-            if (bio_pending > 0) {
+            // Now flush the write BIO to TCP
+            ssl_flush_write_bio(conn);
+            
+            // Measure BIO bytes AFTER flush - this is what went to TCP
+            int bio_bytes_after = BIO_pending(conn->wbio);
+            
+            // Calculate actual TCP bytes sent
+            // Before flush: BIO has encrypted data waiting
+            // After flush: BIO should be empty (or have residual from next record)
+            // Delta = TCP bytes that were flushed
+            u16_t actual_tcp_bytes = (u16_t)(bio_bytes_before - bio_bytes_after);
+            
+            // Only create ACK tracking if there's actual TCP data sent
+            if (actual_tcp_bytes > 0) {
                 // Allocate ACK tracking entry
                 pending_ssl_ack_entry_t* ack_entry = (pending_ssl_ack_entry_t*)malloc(sizeof(pending_ssl_ack_entry_t));
                 if (!ack_entry) {
@@ -881,19 +893,19 @@ extern "C" {
                 ack_entry->message_id = _strdup(message_id);
                 if (!ack_entry->message_id) {
                     printf("ERROR: Failed to duplicate message ID\n");
-                    free(ack_entry);  // Free the entry structure
+                    free(ack_entry);
                     ssl_conn_unref(conn);
                     return -1;
                 }
                 
-                // Track the ACTUAL TCP bytes to be sent (SSL overhead included)
-                ack_entry->bytes_sent = (u16_t)bio_pending;
+                // Track ACTUAL TCP bytes sent (BIO delta after flush)
+                ack_entry->bytes_sent = actual_tcp_bytes;
                 ack_entry->next = NULL;
                 
                 // CRITICAL: Lock before modifying ACK queue to prevent race conditions
                 ssl_lock();
                 
-                // Add to pending ACK queue BEFORE flushing
+                // Add to pending ACK queue
                 if (conn->pending_acks_tail) {
                     conn->pending_acks_tail->next = ack_entry;
                 } else {
@@ -906,10 +918,7 @@ extern "C" {
             
             conn->message_count++;
             
-            // Flush write buffer - this sends TCP packets
-            ssl_flush_write_bio(conn);
-            
-            // IMPORTANT: Call send_complete callback IMMEDIATELY after successful send
+            // Call send_complete callback IMMEDIATELY after successful send
             // This allows application to queue next message without waiting for ACK
             // ACK callback will be called later when TCP confirms delivery
             if (conn->ssl_send_complete_callback) {
