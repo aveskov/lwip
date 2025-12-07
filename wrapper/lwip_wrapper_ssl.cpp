@@ -190,25 +190,19 @@ extern "C" {
         
         if (!conn) return ERR_ARG;
 
-        // DEBUGGING: Log ACK arrival
-        printf("DEBUG SSL ACK CALLBACK: TCP ACKed %d bytes, processing queue...\n", len);
-
         // Process ACK queue to match ACKed bytes with message IDs
         ssl_lock();
         
         u16_t bytes_acked = len;
-        int messages_processed = 0;
         
+        // Process ALL entries that fit within the ACKed bytes
+        // TCP can batch multiple tcp_write() calls into a single ACK
         while (bytes_acked > 0 && conn->pending_acks_head != NULL) {
             pending_ssl_ack_entry_t* ack_entry = conn->pending_acks_head;
-            
-            printf("DEBUG SSL ACK CALLBACK: Processing entry msg_id=%s bytes=%d, remaining_acked=%d\n",
-                   ack_entry->message_id, ack_entry->bytes_sent, bytes_acked);
             
             if (bytes_acked >= ack_entry->bytes_sent) {
                 // This message is fully ACKed
                 bytes_acked -= ack_entry->bytes_sent;
-                messages_processed++;
                 
                 // Remove from queue
                 conn->pending_acks_head = ack_entry->next;
@@ -220,10 +214,7 @@ extern "C" {
                 char* message_id = ack_entry->message_id;
                 ssl_send_ack_complete_callback_t callback = conn->ssl_ack_complete_callback;
                 
-                // Don't free message_id yet - callback might need it
                 free(ack_entry);  // Free the entry structure
-                
-                printf("DEBUG SSL ACK CALLBACK: Calling ACK callback for msg_id=%s\n", message_id);
                 
                 // Call ACK callback outside the lock
                 ssl_unlock();
@@ -235,16 +226,15 @@ extern "C" {
                     free(message_id);
                 }
                 ssl_lock();
+                
+                // Continue processing remaining ACKed bytes
             } else {
-                // Partial ACK - reduce bytes_sent in this entry
-                printf("DEBUG SSL ACK CALLBACK: Partial ACK - reducing entry bytes from %d to %d\n",
-                       ack_entry->bytes_sent, ack_entry->bytes_sent - bytes_acked);
+                // Partial ACK - reduce bytes_sent in this entry and stop
                 ack_entry->bytes_sent -= bytes_acked;
                 bytes_acked = 0;
+                break;
             }
         }
-        
-        printf("DEBUG SSL ACK CALLBACK: Processed %d messages from this TCP ACK\n", messages_processed);
         
         ssl_unlock();
 
@@ -900,10 +890,6 @@ extern "C" {
             // STEP 8: Calculate actual TCP bytes sent
             // This is what was flushed from THIS message
             u16_t actual_tcp_bytes = (u16_t)(bio_after_write - bio_after_flush);
-            
-            // DEBUGGING: Log the measurements
-            printf("DEBUG SSL ACK: msg=%s bio_before=%d bio_after_write=%d bytes_this_write=%d bio_after_flush=%d actual_tcp=%d\n",
-                   message_id, bio_before_write, bio_after_write, bytes_this_write, bio_after_flush, actual_tcp_bytes);
             
             // Only create ACK tracking if actual TCP data was sent
             if (actual_tcp_bytes > 0) {
