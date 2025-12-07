@@ -860,24 +860,26 @@ extern "C" {
             return -1;
         }
 
-        // Send data via SSL (this may produce multiple TCP segments)
+        // CRITICAL FIX: Flush any residual BIO data BEFORE SSL_write
+        // This ensures clean state for accurate measurement
+        ssl_flush_write_bio(conn);
+
+        // Now send data via SSL
         int bytes_written = SSL_write(conn->ssl, data, len);
         
         if (bytes_written > 0) {
-            // FIX: Measure BIO bytes BEFORE flush
-            int bio_bytes_before = BIO_pending(conn->wbio);
+            // Immediately measure BIO bytes after SSL_write
+            // This captures exactly what SSL_write produced
+            int bio_bytes_pending = BIO_pending(conn->wbio);
             
-            // Now flush the write BIO to TCP
+            // Now flush to TCP
             ssl_flush_write_bio(conn);
             
-            // Measure BIO bytes AFTER flush - this is what went to TCP
-            int bio_bytes_after = BIO_pending(conn->wbio);
+            // Verify flush completed
+            int bio_bytes_remaining = BIO_pending(conn->wbio);
             
             // Calculate actual TCP bytes sent
-            // Before flush: BIO has encrypted data waiting
-            // After flush: BIO should be empty (or have residual from next record)
-            // Delta = TCP bytes that were flushed
-            u16_t actual_tcp_bytes = (u16_t)(bio_bytes_before - bio_bytes_after);
+            u16_t actual_tcp_bytes = (u16_t)(bio_bytes_pending - bio_bytes_remaining);
             
             // Only create ACK tracking if there's actual TCP data sent
             if (actual_tcp_bytes > 0) {
@@ -898,7 +900,7 @@ extern "C" {
                     return -1;
                 }
                 
-                // Track ACTUAL TCP bytes sent (BIO delta after flush)
+                // Track ACTUAL TCP bytes sent
                 ack_entry->bytes_sent = actual_tcp_bytes;
                 ack_entry->next = NULL;
                 
