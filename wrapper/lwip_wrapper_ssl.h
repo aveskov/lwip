@@ -46,6 +46,28 @@ __declspec(dllexport) int lwip_ssl_get_send_buffer_available(const char* id);
 // Diagnostic functions for ACK queue monitoring
 __declspec(dllexport) int lwip_ssl_get_pending_ack_count(const char* id);
 
+// Force remote server to send ACK for any pending data
+// Useful when you've finished sending and want immediate confirmation
+__declspec(dllexport) int lwip_ssl_flush_pending_acks(const char* id);
+
+// ===== HIGH-THROUGHPUT BATCH SENDING =====
+// Optimized batch send with TCP_WRITE_FLAG_MORE for maximum throughput
+// Sends multiple messages and flushes only once at the end
+// CRITICAL for 300-byte messages - combines them into fewer TCP packets
+// Returns: number of messages successfully sent (0 to batch_size)
+__declspec(dllexport) int lwip_ssl_send_batch_optimized(const char* id, 
+                                                        const uint8_t** data_array, 
+                                                        const int* len_array, 
+                                                        const char** message_ids, 
+                                                        int batch_size);
+
+// Nagle's algorithm control for throughput tuning
+// Enable Nagle: Better for high-latency networks, batches small packets
+__declspec(dllexport) int lwip_ssl_enable_nagle(const char* id);
+
+// Disable Nagle: Better for low-latency (default for persistent connections)
+__declspec(dllexport) int lwip_ssl_disable_nagle(const char* id);
+
 #ifdef __cplusplus
 }
 #endif

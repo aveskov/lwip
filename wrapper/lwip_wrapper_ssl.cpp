@@ -1,4 +1,4 @@
-extern "C" {
+﻿extern "C" {
 #include <windows.h>
 #include <string.h>
 #include <stdlib.h>
@@ -37,7 +37,7 @@ extern "C" {
         SSL_CONN_MODE_PERSISTENT     // Keep connection open for multiple sends
     } ssl_connection_mode_t;
 
-    // Message tracking structure for ACK callbacks (similar to TCP)
+    // Message tracking structure for TCP ACK callbacks
     typedef struct pending_ssl_ack_entry {
         char* message_id;                         // User-provided message identifier
         u16_t bytes_sent;                         // Number of bytes in this message (for TCP ACK tracking)
@@ -64,9 +64,9 @@ extern "C" {
         ssl_handshake_complete_callback_t handshake_complete_callback;
         ssl_data_received_callback_t data_received_callback;
         ssl_send_complete_callback_t ssl_send_complete_callback;  // Called immediately when SSL_write succeeds
-        ssl_send_ack_complete_callback_t ssl_ack_complete_callback;  // Called later when TCP ACKs message
+        ssl_send_ack_complete_callback_t ssl_ack_complete_callback;  // Called when TCP ACKs message
 
-        // Message tracking for ACK callbacks (persistent mode)
+        // Message tracking for TCP ACK callbacks (persistent mode)
         pending_ssl_ack_entry_t* pending_acks_head;   // Head of pending ACK queue
         pending_ssl_ack_entry_t* pending_acks_tail;   // Tail of pending ACK queue
 
@@ -190,10 +190,13 @@ extern "C" {
         
         if (!conn) return ERR_ARG;
 
+   //     printf("DEBUG ACK BATCH: Received ACK for %d bytes total\n", len);
+
         // Process ACK queue to match ACKed bytes with message IDs
         ssl_lock();
         
         u16_t bytes_acked = len;
+        int messages_in_batch = 0;
         
         // Process ALL entries that fit within the ACKed bytes
         // TCP can batch multiple tcp_write() calls into a single ACK
@@ -202,7 +205,11 @@ extern "C" {
             
             if (bytes_acked >= ack_entry->bytes_sent) {
                 // This message is fully ACKed
+          //      printf("DEBUG ACK BATCH:   → Message '%s' ACKed (%d bytes)\n", 
+          //             ack_entry->message_id, ack_entry->bytes_sent);
+                
                 bytes_acked -= ack_entry->bytes_sent;
+                messages_in_batch++;
                 
                 // Remove from queue
                 conn->pending_acks_head = ack_entry->next;
@@ -231,11 +238,24 @@ extern "C" {
                 // Continue processing remaining ACKed bytes
             } else {
                 // Partial ACK - reduce bytes_sent in this entry and stop
+           //     printf("DEBUG ACK BATCH:   → Partial ACK for message '%s' (%d/%d bytes)\n",
+           //            ack_entry->message_id, bytes_acked, ack_entry->bytes_sent);
                 ack_entry->bytes_sent -= bytes_acked;
                 bytes_acked = 0;
                 break;
             }
         }
+        
+    //    printf("DEBUG ACK BATCH: Processed %d messages in this ACK\n", messages_in_batch);
+        
+        // Count remaining pending
+        int remaining = 0;
+        pending_ssl_ack_entry_t* entry = conn->pending_acks_head;
+        while (entry) {
+            remaining++;
+            entry = entry->next;
+        }
+  //      printf("DEBUG ACK BATCH: %d messages still pending ACK\n", remaining);
         
         ssl_unlock();
 
@@ -934,9 +954,9 @@ extern "C" {
                 
                 ssl_unlock();
 
-                printf("DEBUG SSL ACK: Created ACK entry for msg=%s with %d bytes\n", message_id, actual_tcp_bytes);
+          //      printf("DEBUG SSL ACK: Created ACK entry for msg=%s with %d bytes\n", message_id, actual_tcp_bytes);
             } else {
-                printf("DEBUG SSL ACK: No TCP bytes sent for msg=%s (buffered in BIO)\n", message_id);
+         //       printf("DEBUG SSL ACK: No TCP bytes sent for msg=%s (buffered in BIO)\n", message_id);
             }
             
             conn->message_count++;
@@ -1036,5 +1056,202 @@ extern "C" {
         
         ssl_conn_unref(conn);
         return count;
+    }
+
+    // Force the remote server to send ACK for any pending data
+    // This is useful when you've finished sending and want immediate ACK confirmation
+    int lwip_ssl_flush_pending_acks(const char* id) {
+        if (!id) return -1;
+        
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) return -1;
+        
+        if (conn->state != SSL_STATE_CONNECTED) {
+            ssl_conn_unref(conn);
+            return -1;
+        }
+        
+        // Force TCP to send any pending data and request immediate ACK
+        lwip_lock();
+        if (conn->pcb) {
+            // Method 1: Call tcp_output to flush send buffer
+            tcp_output(conn->pcb);
+            lwip_unlock();
+            
+            // Method 2: Send a zero-length TLS record to trigger ACK
+            // (This forces the server to acknowledge all previous data)
+            SSL_write(conn->ssl, "", 0);
+            ssl_flush_write_bio(conn);
+            
+       //     printf("DEBUG ACK FLUSH: Forced flush for pending ACKs\n");
+            
+            ssl_conn_unref(conn);
+            return 0;
+        }
+        lwip_unlock();
+        
+        ssl_conn_unref(conn);
+        return -1;
+    }
+
+    // Optimized batch send with TCP_WRITE_FLAG_MORE for high throughput
+    // Sends multiple messages and flushes only once at the end
+    // This is CRITICAL for 300-byte messages - combines them into fewer TCP packets
+    int lwip_ssl_send_batch_optimized(const char* id, 
+                                      const uint8_t** data_array, 
+                                      const int* len_array, 
+                                      const char** message_ids, 
+                                      int batch_size) {
+        if (!id || !data_array || !len_array || !message_ids || batch_size <= 0) {
+            printf("ERROR: Invalid parameters for batch send\n");
+            return -1;
+        }
+        
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) {
+            printf("ERROR: SSL connection '%s' not found\n", id);
+            return -1;
+        }
+        
+        // Validate connection state
+        if (conn->state != SSL_STATE_CONNECTED) {
+            printf("ERROR: SSL connection '%s' not ready (state=%d)\n", id, conn->state);
+            ssl_conn_unref(conn);
+            return -1;
+        }
+        
+        if (conn->mode != SSL_CONN_MODE_PERSISTENT) {
+            printf("ERROR: SSL connection '%s' is not persistent\n", id);
+            ssl_conn_unref(conn);
+            return -1;
+        }
+        
+        int successful_sends = 0;
+        
+        // Process all messages in batch
+        for (int i = 0; i < batch_size; i++) {
+            // Measure BIO before this SSL_write
+            int bio_before = BIO_pending(conn->wbio);
+            
+            // Write to SSL
+            int bytes_written = SSL_write(conn->ssl, data_array[i], len_array[i]);
+            
+            if (bytes_written > 0) {
+                int bio_after = BIO_pending(conn->wbio);
+                int ssl_bytes = bio_after - bio_before;
+                
+                // Track this message for ACK
+                pending_ssl_ack_entry_t* ack_entry = (pending_ssl_ack_entry_t*)malloc(sizeof(pending_ssl_ack_entry_t));
+                if (ack_entry) {
+                    ack_entry->message_id = _strdup(message_ids[i]);
+                    if (!ack_entry->message_id) {
+                        free(ack_entry);
+                        continue;  // Skip this message but continue batch
+                    }
+                    
+                    ack_entry->bytes_sent = (u16_t)ssl_bytes;
+                    ack_entry->next = NULL;
+                    
+                    ssl_lock();
+                    if (conn->pending_acks_tail) {
+                        conn->pending_acks_tail->next = ack_entry;
+                    } else {
+                        conn->pending_acks_head = ack_entry;
+                    }
+                    conn->pending_acks_tail = ack_entry;
+                    ssl_unlock();
+                }
+                
+                successful_sends++;
+                conn->message_count++;
+            } else {
+                printf("ERROR: SSL_write failed for message %d in batch\n", i);
+                break;  // Stop on first failure
+            }
+        }
+        
+        // ⭐ KEY OPTIMIZATION: Flush ALL messages at once with optimized TCP flags
+        if (successful_sends > 0) {
+            char buf[4096];
+            int pending = BIO_pending(conn->wbio);
+            int bytes_flushed = 0;
+            
+            while (pending > 0) {
+                int to_read = (pending > sizeof(buf)) ? sizeof(buf) : pending;
+                int read_bytes = BIO_read(conn->wbio, buf, to_read);
+                
+                if (read_bytes <= 0) break;
+                
+                lwip_lock();
+                
+                // Use TCP_WRITE_FLAG_MORE for all chunks except the very last one
+                // This tells TCP to buffer data and send in larger packets
+                int remaining_pending = BIO_pending(conn->wbio);
+                u8_t tcp_flags = TCP_WRITE_FLAG_COPY;
+                
+                if (remaining_pending > 0) {
+                    tcp_flags |= TCP_WRITE_FLAG_MORE;  // More data coming, don't send yet
+                }
+                
+                err_t err = tcp_write(conn->pcb, buf, read_bytes, tcp_flags);
+                
+                if (err == ERR_OK) {
+                    bytes_flushed += read_bytes;
+                    
+                    // Only call tcp_output() on the FINAL chunk to send everything at once
+                    if (remaining_pending == 0) {
+                        tcp_output(conn->pcb);
+                    }
+                } else {
+                    printf("ERROR: tcp_write failed: %d (sent %d/%d bytes)\n", 
+                           err, bytes_flushed, bytes_flushed + read_bytes);
+                    lwip_unlock();
+                    break;
+                }
+                
+                lwip_unlock();
+                
+                if (err != ERR_OK) break;
+                pending = BIO_pending(conn->wbio);
+            }
+            
+            // Call send complete callback once for entire batch
+            if (conn->ssl_send_complete_callback) {
+                conn->ssl_send_complete_callback();
+            }
+        }
+        
+        ssl_conn_unref(conn);
+        return successful_sends;
+    }
+
+    // Enable Nagle's algorithm for better batching (optional - use for high latency networks)
+    int lwip_ssl_enable_nagle(const char* id) {
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) return -1;
+        
+        if (conn->pcb) {
+            lwip_lock();
+            tcp_nagle_enable(conn->pcb);
+            lwip_unlock();
+        }
+        
+        ssl_conn_unref(conn);
+        return 0;
+    }
+
+    // Disable Nagle's algorithm for low latency (default for persistent connections)
+    int lwip_ssl_disable_nagle(const char* id) {
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) return -1;
+        
+        if (conn->pcb) {
+            lwip_lock();
+            tcp_nagle_disable(conn->pcb);
+            lwip_unlock();
+        }
+        
+        ssl_conn_unref(conn);
+        return 0;
     }
 }

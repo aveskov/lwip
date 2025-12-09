@@ -17,25 +17,39 @@ void* ip4_route_custom(const void* src_ip, const void* dest_ip);
 #define LWIP_ETHERNET                   1
 #define LWIP_ARP                        1
 
-// Memory
+// ===== HIGH-PERFORMANCE MEMORY CONFIGURATION =====
 #define MEM_LIBC_MALLOC                 1
 #define MEMP_MEM_MALLOC                 1
 #define MEM_ALIGNMENT                   4
-#define MEM_SIZE                        16000    // Increased from 1600
+#define MEM_SIZE                        (128 * 1024)    // 128KB heap (was 16KB) - for high message rate
 
-// TCP configuration
-#define TCP_MSS                         1460
-#define TCP_SND_BUF                     (8 * TCP_MSS)  // 11680 bytes
-#define TCP_SND_QUEUELEN                ((4 * (TCP_SND_BUF) + (TCP_MSS - 1))/(TCP_MSS))
-#define TCP_WND                         (4 * TCP_MSS)  // Same as SND_BUF
-#define PBUF_POOL_SIZE                  16
+// ===== HIGH-THROUGHPUT TCP CONFIGURATION (Optimized for 300-byte messages) =====
+#define TCP_MSS                         1460             // Standard Ethernet MSS
+
+// CRITICAL: Large buffers for pipelining multiple 300-byte messages
+#define TCP_SND_BUF                     (32 * 1024)      // 32KB send buffer (was 11KB) - holds ~100 messages
+#define TCP_SND_QUEUELEN                (6 * (TCP_SND_BUF) / (TCP_MSS))  // Enough queue entries
+#define TCP_WND                         (64 * 1024)      // 64KB receive window (was 5KB) - high throughput
+
+// Enable Window Scaling for >64KB windows (CRITICAL for throughput)
+#define LWIP_WND_SCALE                  1
+#define TCP_RCV_SCALE                   3                // Window scale factor: 64KB * 2^3 = 512KB max
+
+// Memory pools optimized for high message rate
+#define MEMP_NUM_TCP_SEG                128              // More TCP segments (was 16) - for 300-byte bursts
+#define PBUF_POOL_SIZE                  256              // More packet buffers (was 16)
+#define PBUF_POOL_BUFSIZE               1536             // Larger buffer size for efficiency
+
+// TCP Performance Optimizations
+#define TCP_QUEUE_OOSEQ                 1                // Handle out-of-order segments
+#define TCP_OVERSIZE                    TCP_MSS          // Preallocate for coalescing
+#define LWIP_TCP_TIMESTAMPS             1                // Better RTT estimation
 
 // Optional: use system-provided struct timeval
 #define LWIP_TIMEVAL_PRIVATE            0
 
-// Stats & Debugging - TEMPORARILY ENABLED to diagnose ERR_MEM
+// Stats & Debugging - DISABLED for performance
 #define LWIP_DEBUG                      0
-//#define LWIP_DBG_MIN_LEVEL              LWIP_DBG_LEVEL_ALL
 #define LWIP_DBG_TYPES_ON               LWIP_DBG_OFF
 #define TCP_DEBUG                       LWIP_DBG_OFF
 #define PBUF_DEBUG                      LWIP_DBG_OFF 
