@@ -44,6 +44,32 @@ extern "C" {
     void lwip_close_connection(const char* id);
     void lwip_process_packet(const char* id, const uint8_t* data, int len);
 
+    // ===== HIGH-THROUGHPUT BATCH SENDING =====
+    
+    // Batch TCP send with TCP_WRITE_FLAG_MORE optimization
+    // Sends multiple messages over persistent TCP connection with minimal overhead
+    // All messages are buffered and sent in one tcp_output() call
+    // Returns: number of messages successfully sent (0 to batch_size)
+    // Note: Connection must be established with lwip_tcp_connect_persistent() first
+    int lwip_tcp_send_batch_optimized(const char* id,
+                                       const char* dest_ip_str,
+                                       int port,
+                                       const uint8_t** data_array,
+                                       const int* len_array,
+                                       const char** message_ids,
+                                       int batch_size);
+    
+    // Batch UDP send optimization
+    // Sends multiple UDP datagrams to the same destination with minimal overhead
+    // UDP is connectionless but we still optimize by reusing the PCB and minimizing allocations
+    // Returns: number of messages successfully sent (0 to batch_size)
+    int lwip_udp_send_batch_optimized(const char* id,
+                                       const char* dest_ip_str,
+                                       int port,
+                                       const uint8_t** data_array,
+                                       const int* len_array,
+                                       int batch_size);
+
     // Helper functions for SSL wrapper    
     connection_entry_t* find_connection(const char* id);
     void conn_ref(connection_entry_t* conn);

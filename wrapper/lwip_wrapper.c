@@ -1135,3 +1135,211 @@ int lwip_tcp_get_pending_ack_count(const char* id) {
     conn_unref(conn);
     return count;
 }
+
+// ===== BATCH OPTIMIZATION FUNCTIONS =====
+
+// Batch TCP send with TCP_WRITE_FLAG_MORE for maximum throughput
+// Combines multiple messages into fewer TCP packets
+int lwip_tcp_send_batch_optimized(const char* id,
+                                   const char* dest_ip_str,
+                                   int port,
+                                   const uint8_t** data_array,
+                                   const int* len_array,
+                                   const char** message_ids,
+                                   int batch_size) {
+    if (!id || !dest_ip_str || port <= 0 || port > 65535 || 
+        !data_array || !len_array || !message_ids || batch_size <= 0) {
+        printf("ERROR: Invalid parameters for TCP batch send\n");
+        return -1;
+    }
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) {
+        printf("ERROR: Connection '%s' not found\n", id);
+        return -1;
+    }
+
+    lwip_lock();
+
+    if (!conn->pcb || !conn->persistent_mode) {
+        printf("ERROR: No persistent TCP connection active for %s\n", id);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    int successful_sends = 0;
+    int total_bytes = 0;
+
+    // Calculate total bytes needed
+    for (int i = 0; i < batch_size; i++) {
+        total_bytes += len_array[i];
+    }
+
+    // Check if buffer has enough space for entire batch
+    u16_t available = tcp_sndbuf(conn->pcb);
+    if ((int)available < total_bytes) {
+        printf("WARNING: TCP buffer (%d) < required (%d). Send what fits.\n", available, total_bytes);
+        lwip_unlock();
+        conn_unref(conn);
+        return -2;  // Buffer full
+    }
+
+    // Write all messages with TCP_WRITE_FLAG_MORE except the last
+    for (int i = 0; i < batch_size; i++) {
+        // Create ACK tracking entry
+        pending_ack_entry_t* ack_entry = (pending_ack_entry_t*)malloc(sizeof(pending_ack_entry_t));
+        if (!ack_entry) {
+            printf("ERROR: Failed to allocate ACK tracking entry\n");
+            break;
+        }
+
+        ack_entry->message_id = _strdup(message_ids[i]);
+        if (!ack_entry->message_id) {
+            free(ack_entry);
+            continue;  // Skip this message
+        }
+
+        ack_entry->bytes_sent = (u16_t)len_array[i];
+        ack_entry->next = NULL;
+
+        // ? KEY: Use TCP_WRITE_FLAG_MORE for all except last message
+        u8_t flags = TCP_WRITE_FLAG_COPY;
+        if (i < batch_size - 1) {
+            flags |= TCP_WRITE_FLAG_MORE;  // Tell TCP: more data coming, buffer it
+        }
+
+        err_t wr = tcp_write(conn->pcb, data_array[i], (u16_t)len_array[i], flags);
+        
+        if (wr == ERR_OK) {
+            // Add to pending ACK queue
+            if (conn->pending_acks_tail) {
+                conn->pending_acks_tail->next = ack_entry;
+            } else {
+                conn->pending_acks_head = ack_entry;
+            }
+            conn->pending_acks_tail = ack_entry;
+            
+            successful_sends++;
+        } else {
+            // Failed to write this message
+            printf("ERROR: tcp_write failed for message %d: %d\n", i, wr);
+            free(ack_entry->message_id);
+            free(ack_entry);
+            break;  // Stop on first failure
+        }
+    }
+
+    // ? Flush ALL buffered data with single tcp_output() call
+    if (successful_sends > 0) {
+        tcp_output(conn->pcb);
+        
+        // Call send_complete callback once for entire batch
+        if (conn->send_complete_callback) {
+            conn->send_complete_callback();
+        }
+    }
+
+    lwip_unlock();
+    conn_unref(conn);
+    
+    return successful_sends;
+}
+
+// Batch UDP send optimization
+// Sends multiple UDP datagrams with minimal overhead
+int lwip_udp_send_batch_optimized(const char* id,
+                                   const char* dest_ip_str,
+                                   int port,
+                                   const uint8_t** data_array,
+                                   const int* len_array,
+                                   int batch_size) {
+    if (!id || !dest_ip_str || port <= 0 || port > 65535 || 
+        !data_array || !len_array || batch_size <= 0) {
+        printf("ERROR: Invalid parameters for UDP batch send\n");
+        return -1;
+    }
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) {
+        printf("ERROR: Connection '%s' not found\n", id);
+        return -1;
+    }
+
+    ip_addr_t dest_ip;
+    if (!ipaddr_aton(dest_ip_str, &dest_ip)) {
+        printf("ERROR: Invalid destination IP address\n");
+        conn_unref(conn);
+        return -1;
+    }
+
+    lwip_lock();
+
+    // Create/reuse UDP PCB
+    if (conn->udp_pcb == NULL) {
+        conn->udp_pcb = udp_new();
+        if (!conn->udp_pcb) {
+            printf("ERROR: Failed to create UDP PCB\n");
+            lwip_unlock();
+            conn_unref(conn);
+            return -1;
+        }
+
+        err_t err = udp_bind(conn->udp_pcb, &conn->src_ip, 0);
+        if (err != ERR_OK) {
+            printf("ERROR: UDP bind failed: %d\n", err);
+            udp_remove(conn->udp_pcb);
+            conn->udp_pcb = NULL;
+            lwip_unlock();
+            conn_unref(conn);
+            return -1;
+        }
+
+        udp_recv(conn->udp_pcb, udp_recv_cb, conn);
+    }
+
+    int successful_sends = 0;
+
+    // Send all datagrams in batch
+    // UDP is connectionless, so we optimize by:
+    // 1. Reusing the same UDP PCB
+    // 2. Minimizing allocations
+    // 3. Sending to same destination
+    for (int i = 0; i < batch_size; i++) {
+        // Allocate pbuf for this datagram
+        struct pbuf* p = pbuf_alloc(PBUF_TRANSPORT, len_array[i], PBUF_RAM);
+        if (!p) {
+            printf("ERROR: Failed to allocate pbuf for message %d\n", i);
+            break;  // Stop on first allocation failure
+        }
+
+        // Copy data to pbuf
+        if (pbuf_take(p, data_array[i], len_array[i]) != ERR_OK) {
+            printf("ERROR: Failed to copy data for message %d\n", i);
+            pbuf_free(p);
+            break;
+        }
+
+        // Send the datagram
+        err_t err = udp_sendto(conn->udp_pcb, p, &dest_ip, port);
+        pbuf_free(p);
+
+        if (err == ERR_OK) {
+            successful_sends++;
+        } else {
+            printf("ERROR: UDP send failed for message %d: %d\n", i, err);
+            // Continue with next message (UDP is best-effort anyway)
+        }
+    }
+
+    lwip_unlock();
+
+    // Call send_complete callback once for entire batch
+    if (successful_sends > 0 && conn->send_complete_callback) {
+        conn->send_complete_callback();
+    }
+
+    conn_unref(conn);
+    
+    return successful_sends;
+}

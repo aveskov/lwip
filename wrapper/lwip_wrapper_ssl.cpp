@@ -1095,8 +1095,7 @@ extern "C" {
     }
 
     // Optimized batch send with TCP_WRITE_FLAG_MORE for high throughput
-    // Sends multiple messages and flushes only once at the end
-    // This is CRITICAL for 300-byte messages - combines them into fewer TCP packets
+    // Sends multiple messages and flushes only once at the end    
     int lwip_ssl_send_batch_optimized(const char* id, 
                                       const uint8_t** data_array, 
                                       const int* len_array, 
