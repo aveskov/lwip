@@ -43,8 +43,6 @@ extern "C" {
     int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8_t* data, int len);
     void lwip_close_connection(const char* id);
     void lwip_process_packet(const char* id, const uint8_t* data, int len);
-
-    // ===== HIGH-THROUGHPUT BATCH SENDING =====
     
     // Batch TCP send with TCP_WRITE_FLAG_MORE optimization
     // Sends multiple messages over persistent TCP connection with minimal overhead
