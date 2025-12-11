@@ -190,8 +190,6 @@ extern "C" {
         
         if (!conn) return ERR_ARG;
 
-   //     printf("DEBUG ACK BATCH: Received ACK for %d bytes total\n", len);
-
         // Process ACK queue to match ACKed bytes with message IDs
         ssl_lock();
         
@@ -203,11 +201,7 @@ extern "C" {
         while (bytes_acked > 0 && conn->pending_acks_head != NULL) {
             pending_ssl_ack_entry_t* ack_entry = conn->pending_acks_head;
             
-            if (bytes_acked >= ack_entry->bytes_sent) {
-                // This message is fully ACKed
-          //      printf("DEBUG ACK BATCH:   → Message '%s' ACKed (%d bytes)\n", 
-          //             ack_entry->message_id, ack_entry->bytes_sent);
-                
+            if (bytes_acked >= ack_entry->bytes_sent) {                
                 bytes_acked -= ack_entry->bytes_sent;
                 messages_in_batch++;
                 
@@ -225,8 +219,7 @@ extern "C" {
                 
                 // Call ACK callback outside the lock
                 ssl_unlock();
-                if (callback && message_id) {
-                    printf("ACK callback is called\n");
+                if (callback && message_id) {                    
                     callback(message_id);
                 }
                 // Now safe to free message ID
@@ -235,18 +228,12 @@ extern "C" {
                 }
                 ssl_lock();
                 
-                // Continue processing remaining ACKed bytes
             } else {
-                // Partial ACK - reduce bytes_sent in this entry and stop
-           //     printf("DEBUG ACK BATCH:   → Partial ACK for message '%s' (%d/%d bytes)\n",
-           //            ack_entry->message_id, bytes_acked, ack_entry->bytes_sent);
                 ack_entry->bytes_sent -= bytes_acked;
                 bytes_acked = 0;
                 break;
             }
         }
-        
-    //    printf("DEBUG ACK BATCH: Processed %d messages in this ACK\n", messages_in_batch);
         
         // Count remaining pending
         int remaining = 0;
@@ -255,7 +242,6 @@ extern "C" {
             remaining++;
             entry = entry->next;
         }
-  //      printf("DEBUG ACK BATCH: %d messages still pending ACK\n", remaining);
         
         ssl_unlock();
 
@@ -891,30 +877,30 @@ extern "C" {
             return -1;
         }
 
-        // STEP 1: Flush any residual BIO data from previous operations
+        // Flush any residual BIO data from previous operations
         ssl_flush_write_bio(conn);
 
-        // STEP 2: Measure BIO state BEFORE this SSL_write (should be 0 after flush)
+        // Measure BIO state BEFORE this SSL_write (should be 0 after flush)
         int bio_before_write = BIO_pending(conn->wbio);
 
-        // STEP 3: Perform the SSL_write - this adds encrypted data to BIO
+        // Perform the SSL_write - this adds encrypted data to BIO
         int bytes_written = SSL_write(conn->ssl, data, len);
         
         if (bytes_written > 0) {
-            // STEP 4: Measure BIO immediately AFTER SSL_write
+            // Measure BIO immediately AFTER SSL_write
             // This is the exact amount THIS SSL_write produced
             int bio_after_write = BIO_pending(conn->wbio);
             
-            // STEP 5: Calculate bytes produced by THIS SSL_write only
+            // Calculate bytes produced by THIS SSL_write only
             int bytes_this_write = bio_after_write - bio_before_write;
             
-            // STEP 6: Now flush to TCP (this might not send everything if TCP buffer full)
+            // Now flush to TCP (this might not send everything if TCP buffer full)
             ssl_flush_write_bio(conn);
             
-            // STEP 7: Measure what remains unflushed
+            // Measure what remains unflushed
             int bio_after_flush = BIO_pending(conn->wbio);
             
-            // STEP 8: Calculate actual TCP bytes sent
+            // Calculate actual TCP bytes sent
             // This is what was flushed from THIS message
             u16_t actual_tcp_bytes = (u16_t)(bio_after_write - bio_after_flush);
             
@@ -954,9 +940,6 @@ extern "C" {
                 
                 ssl_unlock();
 
-          //      printf("DEBUG SSL ACK: Created ACK entry for msg=%s with %d bytes\n", message_id, actual_tcp_bytes);
-            } else {
-         //       printf("DEBUG SSL ACK: No TCP bytes sent for msg=%s (buffered in BIO)\n", message_id);
             }
             
             conn->message_count++;
@@ -1058,42 +1041,6 @@ extern "C" {
         return count;
     }
 
-    // Force the remote server to send ACK for any pending data
-    // This is useful when you've finished sending and want immediate ACK confirmation
-    int lwip_ssl_flush_pending_acks(const char* id) {
-        if (!id) return -1;
-        
-        ssl_connection_entry_t* conn = find_ssl_connection(id);
-        if (!conn) return -1;
-        
-        if (conn->state != SSL_STATE_CONNECTED) {
-            ssl_conn_unref(conn);
-            return -1;
-        }
-        
-        // Force TCP to send any pending data and request immediate ACK
-        lwip_lock();
-        if (conn->pcb) {
-            // Method 1: Call tcp_output to flush send buffer
-            tcp_output(conn->pcb);
-            lwip_unlock();
-            
-            // Method 2: Send a zero-length TLS record to trigger ACK
-            // (This forces the server to acknowledge all previous data)
-            SSL_write(conn->ssl, "", 0);
-            ssl_flush_write_bio(conn);
-            
-       //     printf("DEBUG ACK FLUSH: Forced flush for pending ACKs\n");
-            
-            ssl_conn_unref(conn);
-            return 0;
-        }
-        lwip_unlock();
-        
-        ssl_conn_unref(conn);
-        return -1;
-    }
-
     // Optimized batch send with TCP_WRITE_FLAG_MORE for high throughput
     // Sends multiple messages and flushes only once at the end    
     int lwip_ssl_send_batch_optimized(const char* id, 
@@ -1169,7 +1116,7 @@ extern "C" {
             }
         }
         
-        // ⭐ KEY OPTIMIZATION: Flush ALL messages at once with optimized TCP flags
+        // Flush ALL messages at once with optimized TCP flags
         if (successful_sends > 0) {
             char buf[4096];
             int pending = BIO_pending(conn->wbio);
