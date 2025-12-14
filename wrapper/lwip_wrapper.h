@@ -40,6 +40,13 @@ extern "C" {
     int lwip_tcp_get_send_buffer_available(const char* id);  // Check available send buffer    
     int lwip_tcp_get_pending_ack_count(const char* id);
     
+    // TCP Keep-Alive functions to prevent connection from becoming stale
+    // Enable/disable TCP keep-alive with custom intervals
+    // idle_secs: seconds of inactivity before first keep-alive probe (default: 7200s = 2 hours)
+    // interval_secs: seconds between keep-alive probes (default: 75s)
+    // count: number of probes before giving up (default: 9)
+    int lwip_tcp_set_keepalive(const char* id, int enable, int idle_secs, int interval_secs, int count);
+    
     int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8_t* data, int len);
     void lwip_close_connection(const char* id);
     void lwip_process_packet(const char* id, const uint8_t* data, int len);

@@ -1200,4 +1200,65 @@ extern "C" {
         ssl_conn_unref(conn);
         return 0;
     }
+    
+    // Set TCP keep-alive for SSL persistent connections
+    // This prevents connections from timing out during idle periods
+    int lwip_ssl_set_keepalive(const char* id, int enable, int idle_secs, int interval_secs, int count) {
+        if (!id) return -1;
+        
+        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        if (!conn) return -1;
+        
+        if (conn->state != SSL_STATE_CONNECTED && conn->state != SSL_STATE_HANDSHAKING) {
+            printf("ERROR: SSL connection '%s' not in valid state for keep-alive\n", id);
+            ssl_conn_unref(conn);
+            return -1;
+        }
+        
+        if (!conn->pcb) {
+            printf("ERROR: No TCP connection for SSL connection '%s'\n", id);
+            ssl_conn_unref(conn);
+            return -1;
+        }
+        
+        lwip_lock();
+        
+        if (enable) {
+            // Enable TCP keep-alive
+            ip_set_option(conn->pcb, SOF_KEEPALIVE);
+            
+            // Set custom parameters (use shorter intervals for SSL)
+            if (idle_secs > 0) {
+                conn->pcb->keep_idle = idle_secs * 1000;  // Convert to ms
+            } else {
+                conn->pcb->keep_idle = 120000;  // Default: 2 minutes for SSL
+            }
+            
+            if (interval_secs > 0) {
+                conn->pcb->keep_intvl = interval_secs * 1000;
+            } else {
+                conn->pcb->keep_intvl = 30000;  // Default: 30 seconds
+            }
+            
+            if (count > 0) {
+                conn->pcb->keep_cnt = count;
+            } else {
+                conn->pcb->keep_cnt = 3;  // Default: 3 probes
+            }
+            
+            printf("SSL keep-alive enabled for '%s': idle=%ds, interval=%ds, count=%d\n",
+                   id,
+                   (int)(conn->pcb->keep_idle / 1000),
+                   (int)(conn->pcb->keep_intvl / 1000),
+                   conn->pcb->keep_cnt);
+        } else {
+            // Disable keep-alive
+            ip_reset_option(conn->pcb, SOF_KEEPALIVE);
+            printf("SSL keep-alive disabled for '%s'\n", id);
+        }
+        
+        lwip_unlock();
+        ssl_conn_unref(conn);
+        return 0;
+    }
 }

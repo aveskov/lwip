@@ -901,6 +901,62 @@ int lwip_tcp_get_send_buffer_available(const char* id) {
     return (int)available;
 }
 
+// Set TCP keep-alive to prevent persistent connections from becoming stale
+// This sends periodic probes to detect if the peer is still alive
+int lwip_tcp_set_keepalive(const char* id, int enable, int idle_secs, int interval_secs, int count) {
+    if (!id) return -1;
+
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return -1;
+
+    lwip_lock();
+
+    if (!conn->pcb) {
+        printf("ERROR: No active TCP connection for %s\n", id);
+        lwip_unlock();
+        conn_unref(conn);
+        return -1;
+    }
+
+    if (enable) {
+        // Enable TCP keep-alive
+        ip_set_option(conn->pcb, SOF_KEEPALIVE);
+        
+        // Set custom keep-alive parameters if provided
+        if (idle_secs > 0) {
+            conn->pcb->keep_idle = idle_secs * 1000;  // Convert to milliseconds
+        } else {
+            conn->pcb->keep_idle = 7200000;  // Default: 2 hours
+        }
+        
+        if (interval_secs > 0) {
+            conn->pcb->keep_intvl = interval_secs * 1000;  // Convert to milliseconds
+        } else {
+            conn->pcb->keep_intvl = 75000;  // Default: 75 seconds
+        }
+        
+        if (count > 0) {
+            conn->pcb->keep_cnt = count;
+        } else {
+            conn->pcb->keep_cnt = 9;  // Default: 9 probes
+        }
+        
+        printf("TCP keep-alive enabled for '%s': idle=%ds, interval=%ds, count=%d\n", 
+               id, 
+               (int)(conn->pcb->keep_idle / 1000),
+               (int)(conn->pcb->keep_intvl / 1000),
+               conn->pcb->keep_cnt);
+    } else {
+        // Disable TCP keep-alive
+        ip_reset_option(conn->pcb, SOF_KEEPALIVE);
+        printf("TCP keep-alive disabled for '%s'\n", id);
+    }
+
+    lwip_unlock();
+    conn_unref(conn);
+    return 0;
+}
+
 int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8_t* data, int len) {
     if (!id || !dest_ip_str || port <= 0 || port > 65535 || !data || len <= 0) {
         printf("ERROR: Invalid parameters for UDP send\n");

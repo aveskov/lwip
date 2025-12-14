@@ -62,6 +62,13 @@ __declspec(dllexport) int lwip_ssl_enable_nagle(const char* id);
 // Disable Nagle: Better for low-latency (default for persistent connections)
 __declspec(dllexport) int lwip_ssl_disable_nagle(const char* id);
 
+// TCP Keep-Alive for SSL connections
+// Enable keep-alive to prevent persistent SSL connections from timing out
+// idle_secs: seconds of inactivity before first probe (default: 120s recommended for SSL)
+// interval_secs: seconds between probes (default: 30s)
+// count: number of probes before giving up (default: 3)
+__declspec(dllexport) int lwip_ssl_set_keepalive(const char* id, int enable, int idle_secs, int interval_secs, int count);
+
 #ifdef __cplusplus
 }
 #endif

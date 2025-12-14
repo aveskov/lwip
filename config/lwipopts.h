@@ -45,6 +45,13 @@ void* ip4_route_custom(const void* src_ip, const void* dest_ip);
 #define TCP_OVERSIZE                    TCP_MSS          // Preallocate for coalescing
 #define LWIP_TCP_TIMESTAMPS             1                // Better RTT estimation
 
+// ===== TCP KEEP-ALIVE CONFIGURATION =====
+// Enable TCP keep-alive to prevent persistent connections from timing out
+#define LWIP_TCP_KEEPALIVE              1                // Enable keep-alive support
+#define TCP_KEEPIDLE_DEFAULT            7200000          // 2 hours in milliseconds (default)
+#define TCP_KEEPINTVL_DEFAULT           75000            // 75 seconds between probes
+#define TCP_KEEPCNT_DEFAULT             9                // 9 probes before giving up
+
 // Optional: use system-provided struct timeval
 #define LWIP_TIMEVAL_PRIVATE            0
 
