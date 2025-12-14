@@ -19,9 +19,13 @@ lwip_init_stack_global()      ? Initialize lwIP
        ?
 lwip_ssl_init_global()         ? Initialize SSL (if using SSL)
        ?
+Start polling thread           ? Start lwip_poll() loop
+       ?
 Create connections
        ?
 Send/Receive data
+       ?
+Stop polling thread            ? STOP polling FIRST (critical!)
        ?
 lwip_ssl_cleanup_global()      ? Cleanup SSL (if using SSL)
        ?
@@ -130,6 +134,8 @@ public class Application
 public class LwipHostedService : IHostedService
 {
     private readonly ILogger<LwipHostedService> _logger;
+    private CancellationTokenSource _pollingCts;
+    private Task _pollingTask;
     
     public LwipHostedService(ILogger<LwipHostedService> logger)
     {
@@ -146,22 +152,49 @@ public class LwipHostedService : IHostedService
         // Initialize SSL
         lwip_ssl_init_global();
         
+        // ? Start polling thread
+        _pollingCts = new CancellationTokenSource();
+        _pollingTask = Task.Run(() => PollLoop(_pollingCts.Token));
+        
         _logger.LogInformation("? lwIP service started");
         return Task.CompletedTask;
     }
     
-    public Task StopAsync(CancellationToken cancellationToken)
+    public async Task StopAsync(CancellationToken cancellationToken)
     {
         _logger.LogInformation("? Stopping lwIP service...");
         
-        // Cleanup SSL first
+        // ? STEP 1: Stop polling thread FIRST
+        _logger.LogInformation("Stopping polling thread...");
+        _pollingCts?.Cancel();
+        
+        if (_pollingTask != null)
+        {
+            await _pollingTask;  // Wait for polling to stop
+        }
+        _logger.LogInformation("? Polling stopped");
+        
+        // ? STEP 2: Now safe to cleanup
+        _logger.LogInformation("Cleaning up SSL...");
         lwip_ssl_cleanup_global();
         
-        // Then cleanup lwIP (closes all connections)
+        _logger.LogInformation("Cleaning up lwIP...");
         lwip_cleanup_stack_global();
         
         _logger.LogInformation("? lwIP service stopped");
-        return Task.CompletedTask;
+    }
+    
+    private async Task PollLoop(CancellationToken ct)
+    {
+        _logger.LogInformation("Polling thread started");
+        
+        while (!ct.IsCancellationRequested)
+        {
+            lwip_poll();
+            await Task.Delay(10, ct);
+        }
+        
+        _logger.LogInformation("Polling thread exited");
     }
 }
 
@@ -234,6 +267,20 @@ using (var lwip = new LwipManager())
 public class GracefulShutdownExample
 {
     private List<string> _connections = new List<string>();
+    private bool _pollingRunning = true;
+    private Task _pollingTask;
+    
+    public void Start()
+    {
+        // Initialize
+        lwip_init_stack_global();
+        lwip_ssl_init_global();
+        
+        // ? Start polling thread
+        _pollingTask = Task.Run(PollLoop);
+        
+        // Create connections...
+    }
     
     public async Task ShutdownGracefully()
     {
@@ -250,15 +297,30 @@ public class GracefulShutdownExample
             lwip_ssl_disconnect_persistent(connId);
         }
         
-        // Step 3: Cleanup SSL
-        Console.WriteLine("Step 3: Cleaning up SSL...");
+        // ? Step 3: Stop polling thread FIRST (critical!)
+        Console.WriteLine("Step 3: Stopping polling thread...");
+        _pollingRunning = false;
+        await _pollingTask;  // Wait for polling to exit
+        Console.WriteLine("? Polling stopped");
+        
+        // ? Step 4: Cleanup SSL
+        Console.WriteLine("Step 4: Cleaning up SSL...");
         lwip_ssl_cleanup_global();
         
-        // Step 4: Cleanup lwIP (closes any remaining connections)
-        Console.WriteLine("Step 4: Cleaning up lwIP...");
+        // ? Step 5: Cleanup lwIP (closes any remaining connections)
+        Console.WriteLine("Step 5: Cleaning up lwIP...");
         lwip_cleanup_stack_global();
         
         Console.WriteLine("? Graceful shutdown complete");
+    }
+    
+    private async Task PollLoop()
+    {
+        while (_pollingRunning)
+        {
+            lwip_poll();
+            await Task.Delay(10);
+        }
     }
     
     private async Task WaitForAllAcks(TimeSpan timeout)
@@ -285,7 +347,7 @@ public class GracefulShutdownExample
                 return;
             }
             
-            lwip_poll();
+            // Note: lwip_poll() is called by polling thread, not here
             await Task.Delay(100);
         }
         
@@ -354,6 +416,7 @@ public class LwipWindowsService : ServiceBase
 public class ConsoleApplication
 {
     private static bool _running = true;
+    private static Task _pollingTask;
     
     public static async Task Main(string[] args)
     {
@@ -362,21 +425,34 @@ public class ConsoleApplication
         
         try
         {
-            // ? Initialize
+            // ? STEP 1: Initialize
             Console.WriteLine("? Initializing lwIP...");
             lwip_init_stack_global();
             lwip_ssl_init_global();
             
-            // Run application
+            // ? STEP 2: Start polling thread
+            Console.WriteLine("? Starting polling thread...");
+            _pollingTask = Task.Run(PollLoop);
+            
+            // STEP 3: Run application
             Console.WriteLine("Running... Press Ctrl+C to stop");
-            await RunLoop();
+            await DoWork();
         }
         finally
         {
-            // ? Cleanup
-            Console.WriteLine("\n? Cleaning up...");
+            // ? STEP 4: Stop polling FIRST (critical!)
+            Console.WriteLine("\n? Stopping polling thread...");
+            _running = false;
+            await _pollingTask;  // Wait for polling to stop
+            Console.WriteLine("? Polling stopped");
+            
+            // ? STEP 5: Now safe to cleanup
+            Console.WriteLine("? Cleaning up SSL...");
             lwip_ssl_cleanup_global();
+            
+            Console.WriteLine("? Cleaning up lwIP...");
             lwip_cleanup_stack_global();
+            
             Console.WriteLine("? Cleanup complete");
         }
     }
@@ -385,19 +461,78 @@ public class ConsoleApplication
     {
         Console.WriteLine("\n?? Shutdown signal received...");
         e.Cancel = true;  // Prevent immediate termination
-        _running = false;  // Signal loop to stop
+        _running = false;  // Signal polling to stop
     }
     
-    private static async Task RunLoop()
+    private static async Task PollLoop()
     {
+        Console.WriteLine("Polling thread started");
         while (_running)
         {
             lwip_poll();
             await Task.Delay(10);
         }
+        Console.WriteLine("Polling thread exited");
+    }
+    
+    private static async Task DoWork()
+    {
+        while (_running)
+        {
+            // Your application logic here
+            await Task.Delay(1000);
+        }
     }
 }
 ```
+
+---
+
+## ?? Correct Shutdown Sequence
+
+### ? RIGHT: Stop Polling First
+
+```csharp
+// Step 1: Signal polling to stop
+_running = false;
+
+// Step 2: Wait for polling thread to exit
+await _pollingTask;
+
+// Step 3: Now safe to cleanup
+lwip_ssl_cleanup_global();
+lwip_cleanup_stack_global();
+```
+
+### ? WRONG: Cleanup While Polling
+
+```csharp
+// ? DON'T DO THIS!
+lwip_cleanup_stack_global();  // Cleanup starts
+// ... polling thread still running ...
+lwip_poll();  // CRASH! Accessing freed memory
+```
+
+### ? WRONG: Poll After Cleanup
+
+```csharp
+// ? DON'T DO THIS!
+_running = false;
+lwip_cleanup_stack_global();  // Cleanup
+await _pollingTask;           // Polling might call lwip_poll() after cleanup
+// CRASH! lwIP not initialized
+```
+
+---
+
+## ?? CRITICAL: Stop Polling Before Cleanup!
+
+**The polling thread MUST be stopped BEFORE calling cleanup functions!**
+
+### Why?
+- ? If polling continues during cleanup ? **crash** (accessing freed memory)
+- ? If polling continues after cleanup ? **crash** (lwIP not initialized)
+- ? Stop polling ? wait for thread exit ? then cleanup safely
 
 ---
 
@@ -592,10 +727,68 @@ Before application exit:
 - [ ] Stop accepting new connections
 - [ ] Stop sending new messages
 - [ ] Wait for pending ACKs (optional, max 5-10 seconds)
+- [ ] ? **STOP POLLING THREAD** (critical - must be first!)
+- [ ] Wait for polling thread to exit completely
 - [ ] Close individual connections (optional - cleanup does this)
 - [ ] Call `lwip_ssl_cleanup_global()` (if using SSL)
 - [ ] Call `lwip_cleanup_stack_global()`
 - [ ] Verify no lwIP calls after cleanup
+
+---
+
+## ?? Common Shutdown Mistakes
+
+### ? Mistake 1: Cleanup Before Stopping Polling
+
+```csharp
+// ? WRONG - Will crash!
+lwip_cleanup_stack_global();  // Start cleanup
+// ... polling thread still running ...
+lwip_poll();  // CRASH! Memory freed
+```
+
+**Fix**: Stop polling first
+```csharp
+// ? RIGHT
+_running = false;
+await _pollingTask;           // Wait for polling to stop
+lwip_cleanup_stack_global();  // Now safe
+```
+
+### ? Mistake 2: Not Waiting for Polling Thread
+
+```csharp
+// ? WRONG - Race condition!
+_running = false;             // Signal stop
+lwip_cleanup_stack_global();  // But thread might still be polling!
+```
+
+**Fix**: Wait for thread exit
+```csharp
+// ? RIGHT
+_running = false;
+await _pollingTask;           // Wait for thread to exit
+lwip_cleanup_stack_global();  // Now safe
+```
+
+### ? Mistake 3: Calling lwip_poll() in Multiple Threads
+
+```csharp
+// ? WRONG - Not thread-safe!
+Task.Run(() => { while(true) lwip_poll(); });
+Task.Run(() => { while(true) lwip_poll(); });  // Second thread!
+```
+
+**Fix**: Single polling thread only
+```csharp
+// ? RIGHT - One polling thread
+_pollingTask = Task.Run(() => {
+    while (_running) {
+        lwip_poll();
+        Thread.Sleep(10);
+    }
+});
+```
 
 ---
 
