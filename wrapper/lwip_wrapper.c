@@ -507,6 +507,52 @@ void lwip_init_stack_global() {
     netif_set_default(NULL);
 }
 
+// Cleanup entire lwIP stack and all resources on application shutdown
+// This should be called when your application is closing
+void lwip_cleanup_stack_global(void) {
+    if (!lwip_initialized) {
+        return;  // Already cleaned up or never initialized
+    }
+    
+    printf("Cleaning up lwIP stack...\n");
+    
+    // Step 1: Close all active connections
+    lwip_lock();
+    
+    int connection_count = 0;
+    connection_entry_t* conn = connection_list;
+    while (conn) {
+        connection_count++;
+        conn = conn->next;
+    }
+    
+    printf("Closing %d active connections...\n", connection_count);
+    lwip_unlock();
+    
+    // Step 2: Cleanup all connections (this also removes netifs)
+    while (connection_list) {
+        lwip_lock();
+        connection_entry_t* conn = connection_list;
+        if (conn && conn->id) {
+            char* id_copy = _strdup(conn->id);  // Copy ID before cleanup
+            lwip_unlock();
+            
+            printf("  Closing connection: %s\n", id_copy);
+            lwip_close_connection(id_copy);
+            free(id_copy);
+        } else {
+            lwip_unlock();
+        }
+    }
+    
+    printf("All connections closed\n");
+    
+    // Step 3: Cleanup lwIP lock (marks as not initialized)
+    cleanup_lwip_lock();
+    
+    printf("lwIP stack cleanup complete\n");
+}
+
 void lwip_process_packet(const char* id, const uint8_t* data, int len) {
     if (!id || !data || len <= 0) {
         printf("ERROR: Invalid parameters for packet processing\n");

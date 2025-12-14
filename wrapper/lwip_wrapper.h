@@ -19,6 +19,7 @@ extern "C" {
     void init_lwip_lock(void);
     void cleanup_lwip_lock(void);
     void lwip_init_stack_global(void);
+    void lwip_cleanup_stack_global(void);  // Cleanup all resources on application shutdown
     void lwip_poll(void);
 
     // Connection management
