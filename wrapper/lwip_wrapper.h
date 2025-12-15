@@ -55,11 +55,9 @@ extern "C" {
     // Batch TCP send with TCP_WRITE_FLAG_MORE optimization
     // Sends multiple messages over persistent TCP connection with minimal overhead
     // All messages are buffered and sent in one tcp_output() call
-    // Returns: number of messages successfully sent (0 to batch_size)
-    // Note: Connection must be established with lwip_tcp_connect_persistent() first
+    // Prerequisites: Must call lwip_tcp_connect_persistent() first
+    // Returns: number of messages successfully sent (0 to batch_size), -2 if buffer full
     int lwip_tcp_send_batch_optimized(const char* id,
-                                       const char* dest_ip_str,
-                                       int port,
                                        const uint8_t** data_array,
                                        const int* len_array,
                                        const char** message_ids,

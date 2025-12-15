@@ -1,4 +1,4 @@
-#include <windows.h>
+﻿#include <windows.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1238,19 +1238,16 @@ int lwip_tcp_get_pending_ack_count(const char* id) {
     return count;
 }
 
-// ===== BATCH OPTIMIZATION FUNCTIONS =====
 
 // Batch TCP send with TCP_WRITE_FLAG_MORE for maximum throughput
 // Combines multiple messages into fewer TCP packets
+// Prerequisites: Must have active persistent connection (lwip_tcp_connect_persistent called)
 int lwip_tcp_send_batch_optimized(const char* id,
-                                   const char* dest_ip_str,
-                                   int port,
                                    const uint8_t** data_array,
                                    const int* len_array,
                                    const char** message_ids,
                                    int batch_size) {
-    if (!id || !dest_ip_str || port <= 0 || port > 65535 || 
-        !data_array || !len_array || !message_ids || batch_size <= 0) {
+    if (!id || !data_array || !len_array || !message_ids || batch_size <= 0) {
         printf("ERROR: Invalid parameters for TCP batch send\n");
         return -1;
     }
@@ -1305,7 +1302,7 @@ int lwip_tcp_send_batch_optimized(const char* id,
         ack_entry->bytes_sent = (u16_t)len_array[i];
         ack_entry->next = NULL;
 
-        // ? KEY: Use TCP_WRITE_FLAG_MORE for all except last message
+        // ⭐ KEY: Use TCP_WRITE_FLAG_MORE for all except last message
         u8_t flags = TCP_WRITE_FLAG_COPY;
         if (i < batch_size - 1) {
             flags |= TCP_WRITE_FLAG_MORE;  // Tell TCP: more data coming, buffer it
@@ -1332,7 +1329,7 @@ int lwip_tcp_send_batch_optimized(const char* id,
         }
     }
 
-    // ? Flush ALL buffered data with single tcp_output() call
+    // ⭐ Flush ALL buffered data with single tcp_output() call
     if (successful_sends > 0) {
         tcp_output(conn->pcb);
         

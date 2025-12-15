@@ -28,8 +28,6 @@ All optimizations are designed for **small messages (100-1000 bytes)** to maximi
 ### Function Signature
 ```c
 int lwip_tcp_send_batch_optimized(const char* id,
-                                   const char* dest_ip_str,
-                                   int port,
                                    const uint8_t** data_array,
                                    const int* len_array,
                                    const char** message_ids,
@@ -37,16 +35,18 @@ int lwip_tcp_send_batch_optimized(const char* id,
 ```
 
 ### How It Works
-1. **Checks buffer space** - Ensures entire batch fits in TCP send buffer
-2. **Uses `TCP_WRITE_FLAG_MORE`** - All messages except last are marked as "more coming"
-3. **Single `tcp_output()`** - Flushes all buffered data in one call
-4. **ACK tracking** - Each message gets ACK callback when acknowledged
+1. **Requires persistent connection** - Must call `lwip_tcp_connect_persistent()` first
+2. **Checks buffer space** - Ensures entire batch fits in TCP send buffer
+3. **Uses `TCP_WRITE_FLAG_MORE`** - All messages except last are marked as "more coming"
+4. **Single `tcp_output()`** - Flushes all buffered data in one call
+5. **ACK tracking** - Each message gets ACK callback when acknowledged
 
 ### Key Features
 - ? Combines multiple small messages into fewer TCP packets
 - ? Reduces TCP header overhead (~40 bytes per packet saved)
 - ? Maintains reliability (all messages tracked for ACKs)
 - ? Zero message loss
+- ? Works on **existing persistent connection** (no IP/port needed)
 
 ### C# Example
 ```csharp
@@ -63,6 +63,11 @@ public int SendTcpBatch(List<Message> messages)
 {
     const int BATCH_SIZE = 10;
     
+    // ? STEP 1: Must have persistent connection first
+    lwip_tcp_connect_persistent("conn1", "192.168.1.100", 8080, OnAckComplete);
+    Thread.Sleep(100);  // Wait for connection
+    
+    // STEP 2: Prepare batch
     IntPtr[] dataPointers = new IntPtr[BATCH_SIZE];
     int[] lengths = new int[BATCH_SIZE];
     IntPtr[] messageIds = new IntPtr[BATCH_SIZE];
@@ -78,9 +83,9 @@ public int SendTcpBatch(List<Message> messages)
             messageIds[i] = Marshal.StringToHGlobalAnsi(messages[i].Id);
         }
         
-        // ? SEND BATCH
+        // ? STEP 3: Send batch (no IP/port needed - already connected!)
         int result = lwip_tcp_send_batch_optimized(
-            "conn1",
+            "conn1",        // Connection ID only
             dataPointers,
             lengths,
             messageIds,
@@ -103,9 +108,10 @@ public int SendTcpBatch(List<Message> messages)
 
 ### Performance Tips
 - **Batch size**: 10-20 messages for optimal throughput
-- **Prerequisites**: Must call `lwip_tcp_connect_persistent()` first
+- **Prerequisites**: ? **MUST** call `lwip_tcp_connect_persistent()` first
 - **Buffer checking**: Ensure `TCP_SND_BUF >= batch_size * avg_message_size`
 - **Polling**: Call `lwip_poll()` every 10-50ms to process ACKs
+- **Connection reuse**: Send multiple batches on same connection
 
 ---
 
