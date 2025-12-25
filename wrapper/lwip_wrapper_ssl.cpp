@@ -966,13 +966,11 @@ extern "C" {
 
     void lwip_ssl_disconnect_persistent(const char* id) {
         if (!id) {
-            printf("SSL connection '%s' not found for disconnect\n", id);
             return;
         }
 
         ssl_connection_entry_t* conn = find_ssl_connection(id);
         if (!conn) {
-            printf("SSL connection '%s' not found for disconnect\n", id);
             return;
         }
 
@@ -981,10 +979,13 @@ extern "C" {
 
         ssl_lock();
 
-        // Mark state as CLOSING to prevent callbacks from trying to use connection
+        // Save current state before modifying
+        ssl_connection_state_t old_state = conn->state;
+
+        // Mark state as CLOSING to prevent new operations
         conn->state = SSL_STATE_CLOSING;
 
-        // Clear callbacks FIRST to prevent use-after-free
+        // CRITICAL: Clear callbacks FIRST to prevent use-after-free
         conn->handshake_complete_callback = NULL;
         conn->data_received_callback = NULL;
         conn->ssl_send_complete_callback = NULL;
@@ -1001,8 +1002,8 @@ extern "C" {
         }
         conn->pending_acks_tail = NULL;
 
-        // Graceful SSL shutdown
-        if (conn->ssl && conn->state != SSL_STATE_ERROR) {
+        // Graceful SSL shutdown (only if connection was healthy)
+        if (conn->ssl && old_state == SSL_STATE_CONNECTED) {
             int shutdown_status = SSL_shutdown(conn->ssl);
             ssl_flush_write_bio(conn);
             if (shutdown_status == 0) {
@@ -1015,17 +1016,17 @@ extern "C" {
         if (conn->pcb) {
             lwip_lock();
             
-            // Clear all TCP callbacks BEFORE closing to prevent them from being called
+            // Clear ALL TCP callbacks BEFORE closing to prevent them from being called
             tcp_arg(conn->pcb, NULL);
             tcp_recv(conn->pcb, NULL);
             tcp_sent(conn->pcb, NULL);
             tcp_err(conn->pcb, NULL);
             
-            // Try graceful close, fall back to abort if needed
+            // Try graceful close first
             err_t err = tcp_close(conn->pcb);
             if (err != ERR_OK) {
                 // tcp_close failed, abort the connection
-                // Since we already cleared tcp_err callback, ssl_tcp_err_cb won't be called
+                // Since we cleared tcp_err callback, no error callback will be invoked
                 tcp_abort(conn->pcb);
             }
             
@@ -1033,7 +1034,7 @@ extern "C" {
             conn->pcb = NULL;
         }
 
-        // Update state
+        // Update state to CLOSED
         conn->state = SSL_STATE_CLOSED;
 
         ssl_unlock();
@@ -1051,7 +1052,7 @@ extern "C" {
                 *prev = c->next;
                 ssl_unlock();
                 
-                // Release list reference
+                // Release list reference - this may trigger final cleanup
                 ssl_conn_unref(c);
                 
                 printf("SSL connection '%s' closed\n", id);
