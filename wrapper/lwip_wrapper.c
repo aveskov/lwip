@@ -1151,6 +1151,10 @@ void lwip_close_connection(const char* id) {
                 conn->udp_pcb = NULL;
             }
 
+            // CRITICAL FIX: Clear netif->state BEFORE removing netif
+            // This prevents output_cb from accessing invalid state pointer
+            conn->netif.state = NULL;
+
             // Now cleanup network interface
             netif_set_down(&conn->netif);
             netif_remove(&conn->netif);
