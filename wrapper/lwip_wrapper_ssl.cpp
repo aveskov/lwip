@@ -965,6 +965,11 @@ extern "C" {
     }
 
     void lwip_ssl_disconnect_persistent(const char* id) {
+        if (!id) {
+            printf("SSL connection '%s' not found for disconnect\n", id);
+            return;
+        }
+
         ssl_connection_entry_t* conn = find_ssl_connection(id);
         if (!conn) {
             printf("SSL connection '%s' not found for disconnect\n", id);
@@ -973,9 +978,90 @@ extern "C" {
 
         printf("Closing persistent SSL connection '%s' (sent %d messages)\n", 
                id, conn->message_count);
-        
+
+        ssl_lock();
+
+        // Mark state as CLOSING to prevent callbacks from trying to use connection
+        conn->state = SSL_STATE_CLOSING;
+
+        // Clear callbacks FIRST to prevent use-after-free
+        conn->handshake_complete_callback = NULL;
+        conn->data_received_callback = NULL;
+        conn->ssl_send_complete_callback = NULL;
+        conn->ssl_ack_complete_callback = NULL;
+
+        // Clean up pending ACK queue
+        while (conn->pending_acks_head) {
+            pending_ssl_ack_entry_t* next = conn->pending_acks_head->next;
+            if (conn->pending_acks_head->message_id) {
+                free(conn->pending_acks_head->message_id);
+            }
+            free(conn->pending_acks_head);
+            conn->pending_acks_head = next;
+        }
+        conn->pending_acks_tail = NULL;
+
+        // Graceful SSL shutdown
+        if (conn->ssl && conn->state != SSL_STATE_ERROR) {
+            int shutdown_status = SSL_shutdown(conn->ssl);
+            ssl_flush_write_bio(conn);
+            if (shutdown_status == 0) {
+                shutdown_status = SSL_shutdown(conn->ssl);
+                ssl_flush_write_bio(conn);
+            }
+        }
+
+        // Close TCP connection
+        if (conn->pcb) {
+            lwip_lock();
+            
+            // Clear all TCP callbacks BEFORE closing to prevent them from being called
+            tcp_arg(conn->pcb, NULL);
+            tcp_recv(conn->pcb, NULL);
+            tcp_sent(conn->pcb, NULL);
+            tcp_err(conn->pcb, NULL);
+            
+            // Try graceful close, fall back to abort if needed
+            err_t err = tcp_close(conn->pcb);
+            if (err != ERR_OK) {
+                // tcp_close failed, abort the connection
+                // Since we already cleared tcp_err callback, ssl_tcp_err_cb won't be called
+                tcp_abort(conn->pcb);
+            }
+            
+            lwip_unlock();
+            conn->pcb = NULL;
+        }
+
+        // Update state
+        conn->state = SSL_STATE_CLOSED;
+
+        ssl_unlock();
+
+        // Release our reference from find_ssl_connection
         ssl_conn_unref(conn);
-        lwip_ssl_close_connection(id);
+
+        // Now remove from list and final cleanup
+        ssl_lock();
+        ssl_connection_entry_t** prev = &ssl_connection_list;
+        ssl_connection_entry_t* c = ssl_connection_list;
+
+        while (c) {
+            if (c == conn) {
+                *prev = c->next;
+                ssl_unlock();
+                
+                // Release list reference
+                ssl_conn_unref(c);
+                
+                printf("SSL connection '%s' closed\n", id);
+                return;
+            }
+            prev = &c->next;
+            c = c->next;
+        }
+
+        ssl_unlock();
     }
 
     int lwip_ssl_is_connected(const char* id) {
