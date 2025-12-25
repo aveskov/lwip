@@ -119,14 +119,21 @@ struct netif* get_connection_netif(connection_entry_t* conn) {
 }
 
 static err_t output_cb(struct netif* netif, struct pbuf* p, const ip4_addr_t* ipaddr) {
-    if (!netif || !netif->state ||!p) {
-        printf("ERROR: Invalid parameters in output_cb\n");
+    if (!netif || !p) {
+        printf("ERROR: Invalid netif or pbuf in output_cb\n");
+        return ERR_VAL;
+    }
+
+    // Check if netif->state is NULL (connection is being cleaned up)
+    // This is normal during connection shutdown, so don't print error
+    if (!netif->state) {
+        // Connection is closing, silently drop the packet
         return ERR_VAL;
     }
 
     connection_entry_t* conn = (connection_entry_t*)netif->state;
-    if (!conn || !conn->udp_callback) {
-        printf("ERROR: Invalid connection or callback in output_cb\n");
+    if (!conn->udp_callback) {
+        printf("ERROR: Invalid callback in output_cb\n");
         return ERR_VAL;
     }
 
