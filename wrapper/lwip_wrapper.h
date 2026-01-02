@@ -81,6 +81,8 @@ extern "C" {
     void lwip_lock(void);
     void lwip_unlock(void);    
     const ip_addr_t* get_connection_src_ip(connection_entry_t* conn);
+    const ip_addr_t* get_connection_dest_ip(connection_entry_t* conn);
+    void set_connection_dest_ip(connection_entry_t* conn, const ip_addr_t* dest_ip);  // New: Set dest IP
     struct netif* get_connection_netif(connection_entry_t* conn);
 
     // Custom routing
@@ -90,4 +92,4 @@ extern "C" {
 }
 #endif
 
-#endif // LWIP_WRAPPER_H#endif // LWIP_WRAPPER_H
+#endif // LWIP_WRAPPER_H

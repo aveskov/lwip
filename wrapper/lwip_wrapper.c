@@ -30,6 +30,7 @@ typedef struct connection_entry {
     struct tcp_pcb* pcb;
     struct udp_pcb* udp_pcb;
     ip4_addr_t src_ip;
+    ip4_addr_t dest_ip;
     char* message;
     udp_send_callback_t udp_callback;
     send_complete_callback_t send_complete_callback;
@@ -109,6 +110,19 @@ const ip_addr_t* get_connection_src_ip(connection_entry_t* conn) {
         return (const ip_addr_t*)&conn->src_ip;
     }
     return NULL;
+}
+
+const ip_addr_t* get_connection_dest_ip(connection_entry_t* conn) {
+    if (conn) {
+        return (const ip_addr_t*)&conn->dest_ip;
+    }
+    return NULL;
+}
+
+void set_connection_dest_ip(connection_entry_t* conn, const ip_addr_t* dest_ip) {
+    if (conn && dest_ip) {
+        ip4_addr_copy(conn->dest_ip, *ip_2_ip4(dest_ip));
+    }
 }
 
 struct netif* get_connection_netif(connection_entry_t* conn) {
@@ -476,6 +490,7 @@ int lwip_create_connection(const char* id,
     }
 
     conn->src_ip = src_ip;
+    ip4_addr_set_any(&conn->dest_ip);  // Initialize dest_ip as "any" (0.0.0.0)
     conn->udp_callback = udp_cb;
     conn->send_complete_callback = send_complete_cb;
     conn->send_ack_complete_callback = NULL;  // Initialize ACK callback to NULL
@@ -598,6 +613,9 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
         return -1;
     }
 
+    // Store destination IP for routing
+    ip4_addr_copy(conn->dest_ip, *ip_2_ip4(&dest_ip));
+
     conn->pcb = tcp_new();
     if (!conn->pcb) {
         lwip_unlock();
@@ -693,6 +711,9 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
         conn_unref(conn);
         return -1;
     }
+
+    // Store destination IP for routing
+    ip4_addr_copy(conn->dest_ip, *ip_2_ip4(&dest_ip));
 
     conn->pcb = tcp_new();
     if (!conn->pcb) {
@@ -1031,6 +1052,9 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
 
     lwip_lock();
 
+    // Store destination IP for routing
+    ip4_addr_copy(conn->dest_ip, *ip_2_ip4(&dest_ip));
+
     // Reuse existing UDP PCB if available (optimization - like persistent connection)
     if (conn->udp_pcb == NULL) {
         // Create UDP PCB only once
@@ -1098,7 +1122,6 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
     
     return 0;
 }
-
 
 void lwip_close_connection(const char* id) {
     if (!id) {
@@ -1188,9 +1211,26 @@ void* ip4_route_custom(const void* src, const void* dest) {
     }
 
     const ip4_addr_t* src_ip4 = (const ip4_addr_t*)src;
+    const ip4_addr_t* dest_ip4 = dest ? (const ip4_addr_t*)dest : NULL;
 
     lwip_lock();
     connection_entry_t* conn = connection_list;
+    
+    if (dest_ip4) {
+        while (conn) {
+            if (ip4_addr_cmp(&conn->src_ip, src_ip4) && 
+                !ip4_addr_isany_val(conn->dest_ip) &&
+                ip4_addr_cmp(&conn->dest_ip, dest_ip4)) {
+                struct netif* result = &conn->netif;
+                lwip_unlock();            
+                return result;
+            }
+            conn = conn->next;
+        }
+        
+        conn = connection_list;
+    }
+    
     while (conn) {
         if (ip4_addr_cmp(&conn->src_ip, src_ip4)) {
             struct netif* result = &conn->netif;
@@ -1199,11 +1239,11 @@ void* ip4_route_custom(const void* src, const void* dest) {
         }
         conn = conn->next;
     }
+    
     lwip_unlock();
 
     return NULL;
 }
-
 
 void lwip_cleanup_all_connections() {
     lwip_lock();
@@ -1248,7 +1288,6 @@ int lwip_tcp_get_pending_ack_count(const char* id) {
     conn_unref(conn);
     return count;
 }
-
 
 // Batch TCP send with TCP_WRITE_FLAG_MORE for maximum throughput
 // Combines multiple messages into fewer TCP packets
@@ -1384,6 +1423,9 @@ int lwip_udp_send_batch_optimized(const char* id,
     }
 
     lwip_lock();
+
+    // Store destination IP for routing
+    ip4_addr_copy(conn->dest_ip, *ip_2_ip4(&dest_ip));
 
     // Create/reuse UDP PCB
     if (conn->udp_pcb == NULL) {

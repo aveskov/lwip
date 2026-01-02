@@ -560,6 +560,12 @@ extern "C" {
             return -1;
         }
 
+        connection_entry_t* base_for_routing = find_connection(id);
+        if (base_for_routing) {
+            set_connection_dest_ip(base_for_routing, &dest_ip);
+            conn_unref(base_for_routing);
+        }
+
         lwip_lock();
         ssl_conn->pcb = tcp_new();
         if (!ssl_conn->pcb) {
@@ -802,6 +808,12 @@ extern "C" {
             return -1;
         }
 
+        connection_entry_t* base_for_routing = find_connection(id);
+        if (base_for_routing) {
+            set_connection_dest_ip(base_for_routing, &dest_ip);
+            conn_unref(base_for_routing);
+        }
+
         lwip_lock();
         ssl_conn->pcb = tcp_new();
         if (!ssl_conn->pcb) {
@@ -809,7 +821,7 @@ extern "C" {
             lwip_ssl_disconnect_persistent(id);
             return -1;
         }		
-        
+		
         const ip_addr_t* src_ip_ptr = get_connection_src_ip(base_conn);
         if (!src_ip_ptr) {
             lwip_unlock();
