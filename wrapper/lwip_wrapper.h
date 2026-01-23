@@ -84,6 +84,9 @@ extern "C" {
     const ip_addr_t* get_connection_dest_ip(connection_entry_t* conn);
     void set_connection_dest_ip(connection_entry_t* conn, const ip_addr_t* dest_ip);  // New: Set dest IP
     struct netif* get_connection_netif(connection_entry_t* conn);
+    
+    // Clear all callbacks for a connection (used by SSL wrapper on disconnect)
+    void lwip_clear_connection_callbacks(const char* id);
 
     // Custom routing
     void* ip4_route_custom(const void* src, const void* dest);

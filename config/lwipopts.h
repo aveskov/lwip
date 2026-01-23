@@ -2,6 +2,11 @@
 
 void* ip4_route_custom(const void* src_ip, const void* dest_ip);
 
+#ifdef LWIP_WRAPPER_ENABLE_PRINT
+    #define LWIP_PRINTF printf
+#else
+    #define LWIP_PRINTF(...) ((void)0)
+#endif
 
 // OS-less (baremetal)
 #define NO_SYS                          1

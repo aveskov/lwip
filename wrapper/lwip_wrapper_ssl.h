@@ -18,6 +18,7 @@ __declspec(dllexport) void lwip_ssl_cleanup_global(void);
 
 // Non-persistent SSL connection (single send, then close)
 // NOTE: send_complete_cb is optional (can be NULL) - called after SSL_write succeeds
+// Use lwip_ssl_close_connection() to close this type of connection
 __declspec(dllexport) int lwip_ssl_connect(const char* id,
                      const char* dest_ip_str, 
                      int port,
@@ -26,6 +27,10 @@ __declspec(dllexport) int lwip_ssl_connect(const char* id,
                      ssl_data_received_callback_t data_received_cb,
                      ssl_send_complete_callback_t send_complete_cb);  // Optional: can be NULL
 __declspec(dllexport) int lwip_ssl_send_data(const char* id, const uint8_t* data, int len);
+
+// Close non-persistent SSL connection
+// Use this ONLY for connections created with lwip_ssl_connect()
+// For persistent connections, use lwip_ssl_disconnect_persistent() instead
 __declspec(dllexport) void lwip_ssl_close_connection(const char* id);
 
 // Persistent SSL connection (multiple sends over same connection)
@@ -34,10 +39,10 @@ __declspec(dllexport) int lwip_ssl_connect_persistent(const char* id,
                      int port,
                      const char* hostname,
                      ssl_handshake_complete_callback_t handshake_complete_cb,
-                     ssl_data_received_callback_t data_received_cb,
-                     ssl_send_complete_callback_t send_complete_cb,  // Immediate feedback
                      ssl_send_ack_complete_callback_t ack_cb);       // ACK confirmation
 __declspec(dllexport) int lwip_ssl_send_persistent(const char* id, const uint8_t* data, int len, const char* message_id);
+
+// Close persistent SSL connection
 __declspec(dllexport) void lwip_ssl_disconnect_persistent(const char* id);
 
 __declspec(dllexport) int lwip_ssl_is_connected(const char* id);

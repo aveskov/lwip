@@ -1,4 +1,4 @@
-﻿extern "C" {
+extern "C" {
 #include <windows.h>
 #include <string.h>
 #include <stdlib.h>
@@ -62,8 +62,6 @@ extern "C" {
 
         // Callbacks
         ssl_handshake_complete_callback_t handshake_complete_callback;
-        ssl_data_received_callback_t data_received_callback;
-        ssl_send_complete_callback_t ssl_send_complete_callback;  // Called immediately when SSL_write succeeds
         ssl_send_ack_complete_callback_t ssl_ack_complete_callback;  // Called when TCP ACKs message
 
         // Message tracking for TCP ACK callbacks (persistent mode)
@@ -77,7 +75,6 @@ extern "C" {
     static ssl_connection_entry_t* ssl_connection_list = NULL;
     static CRITICAL_SECTION ssl_lock_var;
     static volatile int ssl_initialized = 0;
-    static SSL_CTX* global_ssl_ctx = NULL;
 
 #define ssl_lock()   EnterCriticalSection(&ssl_lock_var)
 #define ssl_unlock() LeaveCriticalSection(&ssl_lock_var)
@@ -85,33 +82,55 @@ extern "C" {
     // Helper functions for reference counting
     static void ssl_conn_ref(ssl_connection_entry_t* conn) {
         if (conn) {
-            InterlockedIncrement(&conn->ref_count);
+            InterlockedIncrement(&conn->ref_count);                       
         }
     }
 
     static void ssl_conn_unref(ssl_connection_entry_t* conn) {
-        if (conn && InterlockedDecrement(&conn->ref_count) == 0) {
-            if (conn->ssl) {
-                SSL_free(conn->ssl);
-            }
-            if (conn->ssl_ctx) {
-                SSL_CTX_free(conn->ssl_ctx);
+        if (conn) {
+            LONG new_count = InterlockedDecrement(&conn->ref_count);
+            
+            // Assert: ref_count should never go negative
+            if (new_count < 0) {
+                LWIP_PRINTF("BUG: too many ssl_conn_unref() calls\n");
+                return;
             }
             
-            // Clean up pending ACK queue
-            while (conn->pending_acks_head) {
-                pending_ssl_ack_entry_t* next = conn->pending_acks_head->next;
-                if (conn->pending_acks_head->message_id) {
-                    free(conn->pending_acks_head->message_id);
+            if (new_count == 0) {
+                LWIP_PRINTF("Freeing SSL connection '%s' (ref_count reached 0)\n",
+                       conn->id ? conn->id : "unknown");
+                
+                if (conn->ssl) {
+                    SSL_free(conn->ssl);
+                    conn->ssl = NULL;  // Prevent double-free
                 }
-                free(conn->pending_acks_head);
-                conn->pending_acks_head = next;
+                if (conn->ssl_ctx) {
+                    SSL_CTX_free(conn->ssl_ctx);
+                    conn->ssl_ctx = NULL;  // Prevent double-free
+                }
+                
+                // Clean up pending ACK queue
+                while (conn->pending_acks_head) {
+                    pending_ssl_ack_entry_t* next = conn->pending_acks_head->next;
+                    if (conn->pending_acks_head->message_id) {
+                        free(conn->pending_acks_head->message_id);
+                    }
+                    free(conn->pending_acks_head);
+                    conn->pending_acks_head = next;
+                }
+                conn->pending_acks_tail = NULL;
+                
+                if (conn->id) {
+                    free(conn->id);
+                    conn->id = NULL;
+                }
+                if (conn->hostname) {
+                    free(conn->hostname);
+                    conn->hostname = NULL;
+                }
+                
+                free(conn);
             }
-            conn->pending_acks_tail = NULL;
-            
-            if (conn->id) free(conn->id);
-            if (conn->hostname) free(conn->hostname);
-            free(conn);
         }
     }
 
@@ -137,7 +156,7 @@ extern "C" {
         ssl_unlock();
 
         if (!conn) {
-            printf("ERROR: SSL Connection '%s' not found.\n", id ? id : "NULL");
+            LWIP_PRINTF("ERROR: SSL Connection '%s' not found.\n", id ? id : "NULL");
         }
         return conn;
     }
@@ -146,7 +165,7 @@ extern "C" {
         unsigned long err = ERR_get_error();
         char err_buf[256];
         ERR_error_string_n(err, err_buf, sizeof(err_buf));
-        printf("SSL Error in %s: %s\n", operation, err_buf);
+        LWIP_PRINTF("SSL Error in %s: %s\n", operation, err_buf);
 
         conn->state = SSL_STATE_ERROR;
 
@@ -174,7 +193,7 @@ extern "C" {
                 tcp_output(conn->pcb);
             }
             else {
-                printf("ERROR: Failed to send SSL data via TCP: %d\n", err);
+                LWIP_PRINTF("ERROR: Failed to send SSL data via TCP: %d\n", err);
             }
             lwip_unlock();
 
@@ -233,16 +252,8 @@ extern "C" {
                 bytes_acked = 0;
                 break;
             }
-        }
-        
-        // Count remaining pending
-        int remaining = 0;
-        pending_ssl_ack_entry_t* entry = conn->pending_acks_head;
-        while (entry) {
-            remaining++;
-            entry = entry->next;
-        }
-        
+        }       
+                
         ssl_unlock();
 
         return ERR_OK;
@@ -286,13 +297,7 @@ extern "C" {
             bytes_read = SSL_read(conn->ssl, buf, sizeof(buf));
             ssl_flush_write_bio(conn);
 
-            if (bytes_read > 0) {
-                // Successfully read application data
-                if (conn->data_received_callback) {
-                    conn->data_received_callback((const uint8_t*)buf, bytes_read);
-                }
-            }
-            else {
+            if (bytes_read <= 0) {
                 int ssl_error = SSL_get_error(conn->ssl, bytes_read);
 
                 if (ssl_error == SSL_ERROR_WANT_READ) {
@@ -301,7 +306,7 @@ extern "C" {
                 }
                 else if (ssl_error == SSL_ERROR_ZERO_RETURN) {
                     // SSL connection closed cleanly
-                    printf("SSL connection closed cleanly for '%s'\n", conn->id);
+                    LWIP_PRINTF("SSL connection closed cleanly for '%s'\n", conn->id);
                     conn->state = SSL_STATE_CLOSED;
                     break;
                 }
@@ -321,7 +326,7 @@ extern "C" {
         if (!conn) return ERR_ARG;
 
         if (!p) {
-            printf("Remote closed SSL connection '%s'\n", conn->id);
+            LWIP_PRINTF("Remote closed SSL connection '%s'\n", conn->id);
             conn->state = SSL_STATE_CLOSED;
             ssl_conn_unref(conn);
             return ERR_OK;
@@ -364,7 +369,7 @@ extern "C" {
 
     static void ssl_tcp_err_cb(void* arg, err_t err) {
         ssl_connection_entry_t* conn = (ssl_connection_entry_t*)arg;
-        printf("SSL TCP error for connection '%s': %d\n", conn ? conn->id : "unknown", err);
+        LWIP_PRINTF("SSL TCP error for connection '%s': %d\n", conn ? conn->id : "unknown", err);
 
         if (conn) {
             conn->state = SSL_STATE_ERROR;
@@ -456,19 +461,19 @@ extern "C" {
         ssl_send_complete_callback_t send_complete_cb) {
 
         if (!id || !dest_ip_str || port <= 0 || port > 65535) {
-            printf("ERROR: Invalid parameters for SSL connection\n");
+            LWIP_PRINTF("ERROR: Invalid parameters for SSL connection\n");
             return -1;
         }
 
         if (!ssl_initialized) {
-            printf("ERROR: SSL not initialized\n");
+            LWIP_PRINTF("ERROR: SSL not initialized\n");
             return -1;
         }
 
         // Find the base connection
         connection_entry_t* base_conn = find_connection(id);
         if (!base_conn) {
-            printf("ERROR: Base connection '%s' not found\n", id);
+            LWIP_PRINTF("ERROR: Base connection '%s' not found\n", id);
             return -1;
         }
 
@@ -478,7 +483,7 @@ extern "C" {
         if (find_ssl_connection_locked(id)) {
             ssl_unlock();
             conn_unref(base_conn);
-            printf("ERROR: SSL connection '%s' already exists\n", id);
+            LWIP_PRINTF("ERROR: SSL connection '%s' already exists\n", id);
             return -1;
         }
 
@@ -506,13 +511,11 @@ extern "C" {
 
         // Set callbacks
         ssl_conn->handshake_complete_callback = handshake_complete_cb;
-        ssl_conn->data_received_callback = data_received_cb;
-        ssl_conn->ssl_send_complete_callback = send_complete_cb;  // Optional: can be NULL
        
         // Create SSL objects
         ssl_conn->ssl_ctx = create_ssl_ctx();
         if (!ssl_conn->ssl_ctx) {
-            printf("ERROR: Failed to create per-connection SSL_CTX with CA\n");
+            LWIP_PRINTF("ERROR: Failed to create per-connection SSL_CTX with CA\n");
             free(ssl_conn->id);
             if (ssl_conn->hostname) free(ssl_conn->hostname);
             free(ssl_conn);
@@ -573,7 +576,7 @@ extern "C" {
             lwip_ssl_close_connection(id);
             return -1;
         }		
-        
+		
         const ip_addr_t* src_ip_ptr = get_connection_src_ip(base_conn);
         if (!src_ip_ptr) {
             lwip_unlock();
@@ -626,15 +629,9 @@ extern "C" {
         ssl_flush_write_bio(conn);
 
         int result = 0;
-        if (bytes_written > 0) {
-            // Data sent successfully
-            // Call send_complete callback if provided (optional)
-            if (conn->ssl_send_complete_callback) {
-                conn->ssl_send_complete_callback();
-            }
-            result = 0;
-        }
-        else {
+        if (bytes_written <= 0) {
+            
+
             int ssl_error = SSL_get_error(conn->ssl, bytes_written);
             if (ssl_error != SSL_ERROR_WANT_WRITE && ssl_error != SSL_ERROR_WANT_READ) {
                 ssl_handle_error(conn, "write");
@@ -655,6 +652,9 @@ extern "C" {
             if (conn->id && strcmp(conn->id, id) == 0) {
                 *prev = conn->next;
 
+                // Clear base connection's UDP callback to prevent it from being invoked
+                lwip_clear_connection_callbacks(id);
+
                 if (conn->ssl && conn->state == SSL_STATE_CONNECTED) {
                     // Graceful TLS shutdown: call SSL_shutdown until it returns 1
                     int shutdown_status = SSL_shutdown(conn->ssl);
@@ -670,20 +670,30 @@ extern "C" {
 
                 if (conn->pcb) {
                     lwip_lock();
+                    
+                    // Clear all callbacks before closing
+                    tcp_arg(conn->pcb, NULL);
+                    tcp_recv(conn->pcb, NULL);
+                    tcp_sent(conn->pcb, NULL);
+                    tcp_err(conn->pcb, NULL);
+                    
                     // Attempt a graceful TCP close
                     err_t err = tcp_close(conn->pcb);
                     if (err != ERR_OK) {
-                        // If tcp_close() fails (e.g. data unacknowledged), you may want to wait/retry.
-                        // As a last resort, fall back to abort:
                         tcp_abort(conn->pcb);
                     }
+                    
+                    // Release callback reference regardless of success/abort
+                    // This reference was added before tcp_connect() in lwip_ssl_connect
+                    ssl_conn_unref(conn);
+                    
                     lwip_unlock();
                     conn->pcb = NULL;
                 }
 
                 ssl_unlock();
                 ssl_conn_unref(conn);
-                printf("SSL connection '%s' closed\n", id);
+                LWIP_PRINTF("SSL connection '%s' closed\n", id);
                 return;
             }
             prev = &conn->next;
@@ -698,24 +708,22 @@ extern "C" {
         int port,
         const char* hostname,
         ssl_handshake_complete_callback_t handshake_complete_cb,
-        ssl_data_received_callback_t data_received_cb,
-        ssl_send_complete_callback_t send_complete_cb,
         ssl_send_ack_complete_callback_t ack_cb) {
 
         if (!id || !dest_ip_str || port <= 0 || port > 65535) {
-            printf("ERROR: Invalid parameters for persistent SSL connection\n");
+            LWIP_PRINTF("ERROR: Invalid parameters for persistent SSL connection\n");
             return -1;
         }
 
         if (!ssl_initialized) {
-            printf("ERROR: SSL not initialized\n");
+            LWIP_PRINTF("ERROR: SSL not initialized\n");
             return -1;
         }
 
         // Find the base connection
         connection_entry_t* base_conn = find_connection(id);
         if (!base_conn) {
-            printf("ERROR: Base connection '%s' not found\n", id);
+            LWIP_PRINTF("ERROR: Base connection '%s' not found\n", id);
             return -1;
         }
 
@@ -725,7 +733,7 @@ extern "C" {
         if (find_ssl_connection_locked(id)) {
             ssl_unlock();
             conn_unref(base_conn);
-            printf("ERROR: SSL connection '%s' already exists\n", id);
+            LWIP_PRINTF("ERROR: SSL connection '%s' already exists\n", id);
             return -1;
         }
 
@@ -753,14 +761,12 @@ extern "C" {
 
         // Set callbacks
         ssl_conn->handshake_complete_callback = handshake_complete_cb;
-        ssl_conn->data_received_callback = data_received_cb;
-        ssl_conn->ssl_send_complete_callback = send_complete_cb;  // Immediate callback
-        ssl_conn->ssl_ack_complete_callback = ack_cb;              // ACK callback
+        ssl_conn->ssl_ack_complete_callback = ack_cb;  // ACK callback for delivery confirmation
        
         // Create SSL objects
         ssl_conn->ssl_ctx = create_ssl_ctx();
         if (!ssl_conn->ssl_ctx) {
-            printf("ERROR: Failed to create per-connection SSL_CTX\n");
+            LWIP_PRINTF("ERROR: Failed to create per-connection SSL_CTX\n");
             free(ssl_conn->id);
             if (ssl_conn->hostname) free(ssl_conn->hostname);
             free(ssl_conn);
@@ -858,25 +864,25 @@ extern "C" {
             return -1;
         }
 
-        printf("Persistent SSL connection '%s' initiated\n", id);
+        LWIP_PRINTF("Persistent SSL connection '%s' initiated\n", id);
         return 0;
     }
 
     int lwip_ssl_send_persistent(const char* id, const uint8_t* data, int len, const char* message_id) {
         if (!message_id) {
-            printf("ERROR: message_id is required for persistent SSL send\n");
+            LWIP_PRINTF("ERROR: message_id is required for persistent SSL send\n");
             return -1;
         }
 
         ssl_connection_entry_t* conn = find_ssl_connection(id);
         if (!conn) {
-            printf("ERROR: SSL connection '%s' not found\n", id);
+            LWIP_PRINTF("ERROR: SSL connection '%s' not found\n", id);
             return -1;
         }
 
         // Check if connection is in correct state
         if (conn->state != SSL_STATE_CONNECTED) {
-            printf("ERROR: SSL connection '%s' not ready (state=%d)\n", 
+            LWIP_PRINTF("ERROR: SSL connection '%s' not ready (state=%d)\n", 
                    id, conn->state);
             ssl_conn_unref(conn);
             return -1;
@@ -884,7 +890,7 @@ extern "C" {
 
         // Check if it's a persistent connection
         if (conn->mode != SSL_CONN_MODE_PERSISTENT) {
-            printf("ERROR: SSL connection '%s' is not persistent\n", id);
+            LWIP_PRINTF("ERROR: SSL connection '%s' is not persistent\n", id);
             ssl_conn_unref(conn);
             return -1;
         }
@@ -921,7 +927,7 @@ extern "C" {
                 // Allocate ACK tracking entry
                 pending_ssl_ack_entry_t* ack_entry = (pending_ssl_ack_entry_t*)malloc(sizeof(pending_ssl_ack_entry_t));
                 if (!ack_entry) {
-                    printf("ERROR: Failed to allocate ACK tracking entry\n");
+                    LWIP_PRINTF("ERROR: Failed to allocate ACK tracking entry\n");
                     ssl_conn_unref(conn);
                     return -1;
                 }
@@ -929,7 +935,7 @@ extern "C" {
                 // Duplicate message ID string
                 ack_entry->message_id = _strdup(message_id);
                 if (!ack_entry->message_id) {
-                    printf("ERROR: Failed to duplicate message ID\n");
+                    LWIP_PRINTF("ERROR: Failed to duplicate message ID\n");
                     free(ack_entry);
                     ssl_conn_unref(conn);
                     return -1;
@@ -956,12 +962,8 @@ extern "C" {
             
             conn->message_count++;
             
-            // Call send_complete callback
-            if (conn->ssl_send_complete_callback) {
-                conn->ssl_send_complete_callback();
-            }
-            
             ssl_conn_unref(conn);
+            
             return 0;
         } else {
             int ssl_error = SSL_get_error(conn->ssl, bytes_written);
@@ -981,15 +983,33 @@ extern "C" {
             return;
         }
 
-        ssl_connection_entry_t* conn = find_ssl_connection(id);
+        ssl_lock();
+        
+        // Find and remove from list (while holding lock)
+        ssl_connection_entry_t** prev = &ssl_connection_list;
+        ssl_connection_entry_t* conn = ssl_connection_list;
+        
+        while (conn) {
+            if (conn->id && strcmp(conn->id, id) == 0) {
+                // Remove from list immediately
+                *prev = conn->next;
+                
+                // Add reference for our use (we're about to work with it)
+                ssl_conn_ref(conn);
+                
+                break;  // Found it
+            }
+            prev = &conn->next;
+            conn = conn->next;
+        }
+        
         if (!conn) {
+            ssl_unlock();
             return;
         }
 
-        printf("Closing persistent SSL connection '%s' (sent %d messages)\n", 
+        LWIP_PRINTF("Closing persistent SSL connection '%s' (sent %d messages)\n", 
                id, conn->message_count);
-
-        ssl_lock();
 
         // Save current state before modifying
         ssl_connection_state_t old_state = conn->state;
@@ -997,10 +1017,8 @@ extern "C" {
         // Mark state as CLOSING to prevent new operations
         conn->state = SSL_STATE_CLOSING;
 
-        // CRITICAL: Clear callbacks FIRST to prevent use-after-free
+        // Clear callbacks to prevent use-after-free
         conn->handshake_complete_callback = NULL;
-        conn->data_received_callback = NULL;
-        conn->ssl_send_complete_callback = NULL;
         conn->ssl_ack_complete_callback = NULL;
 
         // Clean up pending ACK queue
@@ -1014,7 +1032,18 @@ extern "C" {
         }
         conn->pending_acks_tail = NULL;
 
+        // Update state to CLOSED
+        conn->state = SSL_STATE_CLOSED;
+
+        ssl_unlock();
+
+        // Clear base connection's UDP callback to prevent it from being invoked
+        // The SSL connection is built on top of a base lwIP connection
+        // We need to clear its callbacks too
+        lwip_clear_connection_callbacks(id);
+
         // Graceful SSL shutdown (only if connection was healthy)
+        // Do this OUTSIDE lock to avoid blocking other operations
         if (conn->ssl && old_state == SSL_STATE_CONNECTED) {
             int shutdown_status = SSL_shutdown(conn->ssl);
             ssl_flush_write_bio(conn);
@@ -1038,43 +1067,24 @@ extern "C" {
             err_t err = tcp_close(conn->pcb);
             if (err != ERR_OK) {
                 // tcp_close failed, abort the connection
-                // Since we cleared tcp_err callback, no error callback will be invoked
                 tcp_abort(conn->pcb);
+            } else {
+                // tcp_close succeeded - release the callback reference
+                // This reference was added in lwip_ssl_connect_persistent before tcp_connect()
+                ssl_conn_unref(conn);
             }
             
             lwip_unlock();
             conn->pcb = NULL;
         }
 
-        // Update state to CLOSED
-        conn->state = SSL_STATE_CLOSED;
-
-        ssl_unlock();
-
-        // Release our reference from find_ssl_connection
+        // Release list reference - this was the initial ref_count = 1
         ssl_conn_unref(conn);
-
-        // Now remove from list and final cleanup
-        ssl_lock();
-        ssl_connection_entry_t** prev = &ssl_connection_list;
-        ssl_connection_entry_t* c = ssl_connection_list;
-
-        while (c) {
-            if (c == conn) {
-                *prev = c->next;
-                ssl_unlock();
-                
-                // Release list reference - this may trigger final cleanup
-                ssl_conn_unref(c);
-                
-                printf("SSL connection '%s' closed\n", id);
-                return;
-            }
-            prev = &c->next;
-            c = c->next;
-        }
-
-        ssl_unlock();
+        
+        // Release our working reference (from ssl_conn_ref above)
+        ssl_conn_unref(conn);
+        
+        LWIP_PRINTF("SSL connection '%s' closed\n", id);
     }
 
     int lwip_ssl_is_connected(const char* id) {
@@ -1148,25 +1158,25 @@ extern "C" {
                                       const char** message_ids, 
                                       int batch_size) {
         if (!id || !data_array || !len_array || !message_ids || batch_size <= 0) {
-            printf("ERROR: Invalid parameters for batch send\n");
+            LWIP_PRINTF("ERROR: Invalid parameters for batch send\n");
             return -1;
         }
         
         ssl_connection_entry_t* conn = find_ssl_connection(id);
         if (!conn) {
-            printf("ERROR: SSL connection '%s' not found\n", id);
+            LWIP_PRINTF("ERROR: SSL connection '%s' not found\n", id);
             return -1;
         }
         
         // Validate connection state
         if (conn->state != SSL_STATE_CONNECTED) {
-            printf("ERROR: SSL connection '%s' not ready (state=%d)\n", id, conn->state);
+            LWIP_PRINTF("ERROR: SSL connection '%s' not ready (state=%d)\n", id, conn->state);
             ssl_conn_unref(conn);
             return -1;
         }
         
         if (conn->mode != SSL_CONN_MODE_PERSISTENT) {
-            printf("ERROR: SSL connection '%s' is not persistent\n", id);
+            LWIP_PRINTF("ERROR: SSL connection '%s' is not persistent\n", id);
             ssl_conn_unref(conn);
             return -1;
         }
@@ -1210,7 +1220,7 @@ extern "C" {
                 successful_sends++;
                 conn->message_count++;
             } else {
-                printf("ERROR: SSL_write failed for message %d in batch\n", i);
+                LWIP_PRINTF("ERROR: SSL_write failed for message %d in batch\n", i);
                 break;  // Stop on first failure
             }
         }
@@ -1248,7 +1258,7 @@ extern "C" {
                         tcp_output(conn->pcb);
                     }
                 } else {
-                    printf("ERROR: tcp_write failed: %d (sent %d/%d bytes)\n", 
+                    LWIP_PRINTF("ERROR: tcp_write failed: %d (sent %d/%d bytes)\n", 
                            err, bytes_flushed, bytes_flushed + read_bytes);
                     lwip_unlock();
                     break;
@@ -1259,14 +1269,10 @@ extern "C" {
                 if (err != ERR_OK) break;
                 pending = BIO_pending(conn->wbio);
             }
-            
-            // Call send complete callback once for entire batch
-            if (conn->ssl_send_complete_callback) {
-                conn->ssl_send_complete_callback();
-            }
         }
         
-        ssl_conn_unref(conn);
+        ssl_conn_unref(conn);  // Release reference before returning
+        
         return successful_sends;
     }
 
@@ -1309,13 +1315,13 @@ extern "C" {
         if (!conn) return -1;
         
         if (conn->state != SSL_STATE_CONNECTED && conn->state != SSL_STATE_HANDSHAKING) {
-            printf("ERROR: SSL connection '%s' not in valid state for keep-alive\n", id);
+            LWIP_PRINTF("ERROR: SSL connection '%s' not in valid state for keep-alive\n", id);
             ssl_conn_unref(conn);
             return -1;
         }
         
         if (!conn->pcb) {
-            printf("ERROR: No TCP connection for SSL connection '%s'\n", id);
+            LWIP_PRINTF("ERROR: No TCP connection for SSL connection '%s'\n", id);
             ssl_conn_unref(conn);
             return -1;
         }
@@ -1343,17 +1349,10 @@ extern "C" {
                 conn->pcb->keep_cnt = count;
             } else {
                 conn->pcb->keep_cnt = 3;  // Default: 3 probes
-            }
-            
-            printf("SSL keep-alive enabled for '%s': idle=%ds, interval=%ds, count=%d\n",
-                   id,
-                   (int)(conn->pcb->keep_idle / 1000),
-                   (int)(conn->pcb->keep_intvl / 1000),
-                   conn->pcb->keep_cnt);
+            }           
         } else {
             // Disable keep-alive
             ip_reset_option(conn->pcb, SOF_KEEPALIVE);
-            printf("SSL keep-alive disabled for '%s'\n", id);
         }
         
         lwip_unlock();

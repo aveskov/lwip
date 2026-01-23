@@ -83,25 +83,37 @@ void conn_ref(connection_entry_t* conn) {
 
 // Helper function to safely decrement reference count and cleanup if needed
 void conn_unref(connection_entry_t* conn) {
-    if (conn && InterlockedDecrement(&conn->ref_count) == 0) {
-        // Safe to cleanup
-        if (conn->id) free(conn->id);
-        if (conn->message) free(conn->message);
-        
-        // Clean up pending ACK queue to prevent memory leaks
-        // This can happen when connection is freed via error callbacks
-        // or lwip_cleanup_all_connections() before ACKs are received
-        while (conn->pending_acks_head) {
-            pending_ack_entry_t* next = conn->pending_acks_head->next;
-            if (conn->pending_acks_head->message_id) {
-                free(conn->pending_acks_head->message_id);
-            }
-            free(conn->pending_acks_head);
-            conn->pending_acks_head = next;
+    if (conn) {
+        LONG new_count = InterlockedDecrement(&conn->ref_count);
+
+        if (new_count < 0) {
+            LWIP_PRINTF("BUG: too many conn_unref() calls\n");
+            return;
         }
-        conn->pending_acks_tail = NULL;
-        
-        free(conn);
+
+        if (new_count == 0) {
+            LWIP_PRINTF("Freeing TCP connection '%s' (ref_count reached 0)\n",
+                conn->id ? conn->id : "unknown");
+
+            // Safe to cleanup
+            if (conn->id) free(conn->id);
+            if (conn->message) free(conn->message);
+
+            // Clean up pending ACK queue to prevent memory leaks
+            // This can happen when connection is freed via error callbacks
+            // or lwip_cleanup_all_connections() before ACKs are received
+            while (conn->pending_acks_head) {
+                pending_ack_entry_t* next = conn->pending_acks_head->next;
+                if (conn->pending_acks_head->message_id) {
+                    free(conn->pending_acks_head->message_id);
+                }
+                free(conn->pending_acks_head);
+                conn->pending_acks_head = next;
+            }
+            conn->pending_acks_tail = NULL;
+
+            free(conn);
+        }
     }
 }
 
@@ -134,7 +146,7 @@ struct netif* get_connection_netif(connection_entry_t* conn) {
 
 static err_t output_cb(struct netif* netif, struct pbuf* p, const ip4_addr_t* ipaddr) {
     if (!netif || !p) {
-        printf("ERROR: Invalid netif or pbuf in output_cb\n");
+        LWIP_PRINTF("ERROR: Invalid netif or pbuf in output_cb\n");
         return ERR_VAL;
     }
 
@@ -146,42 +158,54 @@ static err_t output_cb(struct netif* netif, struct pbuf* p, const ip4_addr_t* ip
     }
 
     connection_entry_t* conn = (connection_entry_t*)netif->state;
+    
+    // Add reference to prevent connection from being freed during callback execution
+    conn_ref(conn);
+    
+    // Double-check callback is still valid after taking reference
     if (!conn->udp_callback) {
-        printf("ERROR: Invalid callback in output_cb\n");
+        conn_unref(conn);
         return ERR_VAL;
     }
 
     uint8_t* buf = malloc(p->tot_len);
     if (!buf) {
-        printf("ERROR: Memory allocation failed in output_cb\n");
+        LWIP_PRINTF("ERROR: Memory allocation failed in output_cb\n");
+        conn_unref(conn);
         return ERR_MEM;
     }
 
     pbuf_copy_partial(p, buf, p->tot_len, 0);
+    
+    // Call callback while holding reference
     conn->udp_callback(buf, p->tot_len);
     free(buf);
+
+    // Release reference after callback completes
+    conn_unref(conn);
 
     return ERR_OK;
 }
 
 static err_t linkoutput_cb(struct netif* netif, struct pbuf* p) {
+    // Pass through to output_cb which has proper reference counting
     return output_cb(netif, p, NULL);
 }
 
 static void input_cb(connection_entry_t* conn, const uint8_t* data, int len) {
     if (!conn || !data || len <= 0) {
-        printf("ERROR: Invalid parameters in input_cb\n");
+        LWIP_PRINTF("ERROR: Invalid parameters in input_cb\n");
         return;
     }
 
     struct pbuf* p = pbuf_alloc(PBUF_RAW, len, PBUF_POOL);
     if (!p) {
-        printf("ERROR: Failed to allocate pbuf in input_cb\n");
+        LWIP_PRINTF("ERROR: Failed to allocate pbuf in input_cb\n");
         return;
     }
 
     if (pbuf_take(p, data, len) != ERR_OK) {
-        printf("ERROR: Failed to copy data to pbuf\n");
+        LWIP_PRINTF("ERROR: Failed to copy data to pbuf\n");
         pbuf_free(p);
         return;
     }
@@ -254,10 +278,6 @@ static err_t on_tcp_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
     connection_entry_t* conn = (connection_entry_t*)arg;
     if (!conn) return ERR_ARG;    
 
-    if (conn->send_complete_callback) {
-        conn->send_complete_callback();
-    }
-
     lwip_lock();
     if (tpcb && conn->pcb == tpcb) {
         tcp_arg(tpcb, NULL);
@@ -270,7 +290,7 @@ static err_t on_tcp_sent(void* arg, struct tcp_pcb* tpcb, u16_t len) {
             err_t close_err = tcp_close(tpcb);
             if (close_err != ERR_OK) {
                 // If close fails, abort the connection
-                printf("tcp_close failed: %d, aborting\n", close_err);
+                LWIP_PRINTF("tcp_close failed: %d, aborting\n", close_err);
                 tcp_abort(tpcb);
             }
         } else {
@@ -313,15 +333,10 @@ static err_t tcp_connected(void* arg, struct tcp_pcb* tpcb, err_t err) {
                 tcp_sent(tpcb, on_tcp_sent);
                 tcp_arg(tpcb, conn);
                 conn_ref(conn);  // Add reference for sent callback
-            } else {
-                // Persistent mode: callback already set above
-                if (conn->send_complete_callback) {
-                    conn->send_complete_callback();
-                }
             }
         }
         else {
-            printf("tcp_write failed: %d\n", wr);
+            LWIP_PRINTF("tcp_write failed: %d\n", wr);
             // Clean up on write failure
             tcp_arg(tpcb, NULL);
             tcp_sent(tpcb, NULL);
@@ -360,7 +375,7 @@ static err_t tcp_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
     connection_entry_t* conn = (connection_entry_t*)arg;
 
     if (!p) {
-        printf("Remote closed the connection.\n");
+        LWIP_PRINTF("Remote closed the connection.\n");
         lwip_lock();
         if (tpcb && conn && conn->pcb == tpcb) {
             tcp_close(tpcb);
@@ -389,7 +404,7 @@ static err_t tcp_recv_cb(void* arg, struct tcp_pcb* tpcb, struct pbuf* p, err_t 
 
 static void on_tcp_error(void* arg, err_t err) {
     connection_entry_t* conn = (connection_entry_t*)arg;
-    printf("TCP error: %d\n", err);
+    LWIP_PRINTF("TCP error: %d\n", err);
 
     if (conn) {
         lwip_lock();
@@ -440,7 +455,7 @@ connection_entry_t* find_connection(const char* id) {
     lwip_unlock();
 
     if (!conn) {
-       printf("Connection '%s' not found.\n", id ? id : "NULL");
+       LWIP_PRINTF("Connection '%s' not found.\n", id ? id : "NULL");
     }
 
     return conn;
@@ -454,7 +469,7 @@ int lwip_create_connection(const char* id,
     send_complete_callback_t send_complete_cb) {
 
     if (!id || !src_ip_str || !netmask_str || !gw_str) {
-        printf("ERROR: Invalid parameters for connection creation\n");
+        LWIP_PRINTF("ERROR: Invalid parameters for connection creation\n");
         return -1;
     }
 
@@ -462,7 +477,7 @@ int lwip_create_connection(const char* id,
     if (!ipaddr_aton(src_ip_str, &src_ip) ||
         !ipaddr_aton(netmask_str, &netmask) ||
         !ipaddr_aton(gw_str, &gw)) {
-        printf("ERROR: Invalid IP address format\n");
+        LWIP_PRINTF("ERROR: Invalid IP address format\n");
         return -1;
     }
 
@@ -470,14 +485,14 @@ int lwip_create_connection(const char* id,
    
     if (find_connection_locked(id)) {
         lwip_unlock();
-        printf("ERROR: Connection '%s' already exists\n", id);
+        LWIP_PRINTF("ERROR: Connection '%s' already exists\n", id);
         return -1;
     }
 
     connection_entry_t* conn = (connection_entry_t*)calloc(1, sizeof(connection_entry_t));
     if (!conn) {
         lwip_unlock();
-        printf("ERROR: Memory allocation failed\n");
+        LWIP_PRINTF("ERROR: Memory allocation failed\n");
         return -1;
     }
 
@@ -485,7 +500,7 @@ int lwip_create_connection(const char* id,
     if (!conn->id) {
         free(conn);
         lwip_unlock();
-        printf("ERROR: Failed to duplicate connection ID\n");
+        LWIP_PRINTF("ERROR: Failed to duplicate connection ID\n");
         return -1;
     }
 
@@ -503,7 +518,7 @@ int lwip_create_connection(const char* id,
         free(conn->id);
         free(conn);
         lwip_unlock();
-        printf("ERROR: Failed to add network interface\n");
+        LWIP_PRINTF("ERROR: Failed to add network interface\n");
         return -1;
     }
 
@@ -536,9 +551,8 @@ void lwip_cleanup_stack_global(void) {
         return;  // Already cleaned up or never initialized
     }
     
-    printf("Cleaning up lwIP stack...\n");
+    LWIP_PRINTF("Cleaning up lwIP stack...\n");
     
-    // Step 1: Close all active connections
     lwip_lock();
     
     int connection_count = 0;
@@ -548,10 +562,9 @@ void lwip_cleanup_stack_global(void) {
         conn = conn->next;
     }
     
-    printf("Closing %d active connections...\n", connection_count);
+    LWIP_PRINTF("Closing %d active connections...\n", connection_count);
     lwip_unlock();
     
-    // Step 2: Cleanup all connections (this also removes netifs)
     while (connection_list) {
         lwip_lock();
         connection_entry_t* conn = connection_list;
@@ -559,7 +572,7 @@ void lwip_cleanup_stack_global(void) {
             char* id_copy = _strdup(conn->id);  // Copy ID before cleanup
             lwip_unlock();
             
-            printf("  Closing connection: %s\n", id_copy);
+            LWIP_PRINTF("  Closing connection: %s\n", id_copy);
             lwip_close_connection(id_copy);
             free(id_copy);
         } else {
@@ -567,17 +580,16 @@ void lwip_cleanup_stack_global(void) {
         }
     }
     
-    printf("All connections closed\n");
+    LWIP_PRINTF("All connections closed\n");
     
-    // Step 3: Cleanup lwIP lock (marks as not initialized)
     cleanup_lwip_lock();
     
-    printf("lwIP stack cleanup complete\n");
+    LWIP_PRINTF("lwIP stack cleanup complete\n");
 }
 
 void lwip_process_packet(const char* id, const uint8_t* data, int len) {
     if (!id || !data || len <= 0) {
-        printf("ERROR: Invalid parameters for packet processing\n");
+        LWIP_PRINTF("ERROR: Invalid parameters for packet processing\n");
         return;
     }
 
@@ -590,7 +602,7 @@ void lwip_process_packet(const char* id, const uint8_t* data, int len) {
 
 int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char* message) {
     if (!id || !dest_ip_str || port <= 0 || port > 65535) {
-        printf("ERROR: Invalid parameters for connection\n");
+        LWIP_PRINTF("ERROR: Invalid parameters for connection\n");
         return -1;
     }
 
@@ -599,7 +611,7 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
 
     ip_addr_t dest_ip;
     if (!ipaddr_aton(dest_ip_str, &dest_ip)) {
-        printf("ERROR: Invalid destination IP address\n");
+        LWIP_PRINTF("ERROR: Invalid destination IP address\n");
         conn_unref(conn);
         return -1;
     }
@@ -607,7 +619,7 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
     lwip_lock();
 
     if (conn->pcb != NULL) {
-        printf("ERROR: Connection %s already active\n", id);
+        LWIP_PRINTF("ERROR: Connection %s already active\n", id);
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -619,7 +631,7 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
     conn->pcb = tcp_new();
     if (!conn->pcb) {
         lwip_unlock();
-        printf("Failed to allocate new PCB for connection %s\n", id);
+        LWIP_PRINTF("Failed to allocate new PCB for connection %s\n", id);
         conn_unref(conn);
         return -1;
     }
@@ -638,7 +650,7 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
                 tcp_abort(conn->pcb);
                 conn->pcb = NULL;
                 lwip_unlock();
-                printf("ERROR: Failed to duplicate message\n");
+                LWIP_PRINTF("ERROR: Failed to duplicate message\n");
                 conn_unref(conn);
                 return -1;
             }
@@ -647,7 +659,7 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
 
     err_t bind_result = tcp_bind(conn->pcb, &conn->pcb->local_ip, 0);
     if (bind_result != ERR_OK) {
-        printf("ERROR: tcp_bind failed: %d\n", bind_result);
+        LWIP_PRINTF("ERROR: tcp_bind failed: %d\n", bind_result);
         tcp_abort(conn->pcb);
         if (conn->message) {
             free(conn->message);
@@ -667,7 +679,7 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
     err_t ret = tcp_connect(conn->pcb, &dest_ip, port, tcp_connected);
 
     if (ret != ERR_OK) {
-        printf("ERROR: tcp_connect failed: %d\n", ret);
+        LWIP_PRINTF("ERROR: tcp_connect failed: %d\n", ret);
         // Clean up on connect failure
         tcp_abort(conn->pcb);
         conn->pcb = NULL;
@@ -689,7 +701,7 @@ int lwip_tcp_send(const char* id, const char* dest_ip_str, int port, const char*
 // Create persistent TCP connection (avoids handshake overhead)
 int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int port, send_ack_complete_callback_t ack_cb) {
     if (!id || !dest_ip_str || port <= 0 || port > 65535) {
-        printf("ERROR: Invalid parameters for persistent connection\n");
+        LWIP_PRINTF("ERROR: Invalid parameters for persistent connection\n");
         return -1;
     }
 
@@ -698,7 +710,7 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
 
     ip_addr_t dest_ip;
     if (!ipaddr_aton(dest_ip_str, &dest_ip)) {
-        printf("ERROR: Invalid destination IP address\n");
+        LWIP_PRINTF("ERROR: Invalid destination IP address\n");
         conn_unref(conn);
         return -1;
     }
@@ -706,7 +718,7 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
     lwip_lock();
 
     if (conn->pcb != NULL) {
-        printf("ERROR: Connection %s already active\n", id);
+        LWIP_PRINTF("ERROR: Connection %s already active\n", id);
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -718,7 +730,7 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
     conn->pcb = tcp_new();
     if (!conn->pcb) {
         lwip_unlock();
-        printf("Failed to allocate new PCB for connection %s\n", id);
+        LWIP_PRINTF("Failed to allocate new PCB for connection %s\n", id);
         conn_unref(conn);
         return -1;
     }
@@ -734,7 +746,7 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
 
     err_t bind_result = tcp_bind(conn->pcb, &conn->pcb->local_ip, 0);
     if (bind_result != ERR_OK) {
-        printf("ERROR: tcp_bind failed: %d\n", bind_result);
+        LWIP_PRINTF("ERROR: tcp_bind failed: %d\n", bind_result);
         tcp_abort(conn->pcb);
         conn->pcb = NULL;
         conn->send_ack_complete_callback = NULL;
@@ -751,7 +763,7 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
     err_t ret = tcp_connect(conn->pcb, &dest_ip, port, tcp_connected);
 
     if (ret != ERR_OK) {
-        printf("ERROR: tcp_connect failed: %d\n", ret);
+        LWIP_PRINTF("ERROR: tcp_connect failed: %d\n", ret);
         tcp_abort(conn->pcb);
         conn->pcb = NULL;
         conn->persistent_mode = 0;
@@ -771,7 +783,7 @@ int lwip_tcp_connect_persistent(const char* id, const char* dest_ip_str, int por
 // Message ID is mandatory - use it to track ACK callbacks
 int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len, const char* message_id) {
     if (!id || !data || len <= 0 || !message_id) {
-        printf("ERROR: Invalid parameters for persistent send\n");
+        LWIP_PRINTF("ERROR: Invalid parameters for persistent send\n");
         return -1;
     }
 
@@ -781,7 +793,7 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len, const
     lwip_lock();
 
     if (!conn->pcb || !conn->persistent_mode) {
-        printf("ERROR: No persistent connection active for %s\n", id);
+        LWIP_PRINTF("ERROR: No persistent connection active for %s\n", id);
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -790,7 +802,7 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len, const
     // IMPORTANT: Check if there's enough buffer space BEFORE writing
     u16_t available = tcp_sndbuf(conn->pcb);
     if (available == 0) {
-        printf("WARNING: TCP send buffer full (0 bytes available). Caller should retry after lwip_poll().\n");
+        LWIP_PRINTF("WARNING: TCP send buffer full (0 bytes available). Caller should retry after lwip_poll().\n");
         lwip_unlock();
         conn_unref(conn);
         return -2;
@@ -805,7 +817,7 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len, const
     // Allocate ACK tracking entry
     pending_ack_entry_t* ack_entry = (pending_ack_entry_t*)malloc(sizeof(pending_ack_entry_t));
     if (!ack_entry) {
-        printf("ERROR: Failed to allocate ACK tracking entry\n");
+        LWIP_PRINTF("ERROR: Failed to allocate ACK tracking entry\n");
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -814,7 +826,7 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len, const
     // Duplicate message ID string
     ack_entry->message_id = _strdup(message_id);
     if (!ack_entry->message_id) {
-        printf("ERROR: Failed to duplicate message ID\n");
+        LWIP_PRINTF("ERROR: Failed to duplicate message ID\n");
         free(ack_entry);
         lwip_unlock();
         conn_unref(conn);
@@ -836,12 +848,7 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len, const
         conn->pending_acks_tail = ack_entry;
         
         tcp_output(conn->pcb);
-        lwip_unlock();
-        
-        // Call send_complete callback (not ACK callback - that comes later in on_tcp_sent_persistent)
-        if (conn->send_complete_callback) {
-            conn->send_complete_callback();
-        }
+        lwip_unlock();       
         
         conn_unref(conn);
         return 0;
@@ -858,7 +865,7 @@ int lwip_tcp_send_persistent(const char* id, const uint8_t* data, int len, const
         }
         else {
             // Fatal error (not buffer related)
-            printf("ERROR: tcp_write failed with error: %d\n", wr);
+            LWIP_PRINTF("ERROR: tcp_write failed with error: %d\n", wr);
             lwip_unlock();
             conn_unref(conn);
             return -1;  // Fatal
@@ -876,8 +883,7 @@ void lwip_tcp_disconnect_persistent(const char* id) {
     lwip_lock();
 
     if (conn->pcb && conn->persistent_mode) {
-        // CRITICAL: Clear callbacks FIRST to prevent use-after-free
-        conn->send_complete_callback = NULL;
+        // Clear callbacks FIRST to prevent use-after-free
         conn->send_ack_complete_callback = NULL;
         
         // Clean up pending ACK queue (including message ID strings)
@@ -904,7 +910,7 @@ void lwip_tcp_disconnect_persistent(const char* id) {
         if (netif_is_up(&conn->netif)) {
             err_t close_err = tcp_close(conn->pcb);
             if (close_err != ERR_OK) {
-                printf("tcp_close failed: %d, aborting\n", close_err);
+                LWIP_PRINTF("tcp_close failed: %d, aborting\n", close_err);
                 tcp_abort(conn->pcb);  // This will call on_tcp_error
             } else {
                 // tcp_close succeeded - connection closed gracefully
@@ -935,7 +941,7 @@ int lwip_tcp_set_nodelay(const char* id, int enable) {
     lwip_lock();
 
     if (!conn->pcb) {
-        printf("ERROR: No active TCP connection for %s\n", id);
+        LWIP_PRINTF("ERROR: No active TCP connection for %s\n", id);
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -986,7 +992,7 @@ int lwip_tcp_set_keepalive(const char* id, int enable, int idle_secs, int interv
     lwip_lock();
 
     if (!conn->pcb) {
-        printf("ERROR: No active TCP connection for %s\n", id);
+        LWIP_PRINTF("ERROR: No active TCP connection for %s\n", id);
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -1015,7 +1021,7 @@ int lwip_tcp_set_keepalive(const char* id, int enable, int idle_secs, int interv
             conn->pcb->keep_cnt = 9;  // Default: 9 probes
         }
         
-        printf("TCP keep-alive enabled for '%s': idle=%ds, interval=%ds, count=%d\n", 
+        LWIP_PRINTF("TCP keep-alive enabled for '%s': idle=%ds, interval=%ds, count=%d\n", 
                id, 
                (int)(conn->pcb->keep_idle / 1000),
                (int)(conn->pcb->keep_intvl / 1000),
@@ -1023,7 +1029,7 @@ int lwip_tcp_set_keepalive(const char* id, int enable, int idle_secs, int interv
     } else {
         // Disable TCP keep-alive
         ip_reset_option(conn->pcb, SOF_KEEPALIVE);
-        printf("TCP keep-alive disabled for '%s'\n", id);
+        LWIP_PRINTF("TCP keep-alive disabled for '%s'\n", id);
     }
 
     lwip_unlock();
@@ -1033,19 +1039,19 @@ int lwip_tcp_set_keepalive(const char* id, int enable, int idle_secs, int interv
 
 int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8_t* data, int len) {
     if (!id || !dest_ip_str || port <= 0 || port > 65535 || !data || len <= 0) {
-        printf("ERROR: Invalid parameters for UDP send\n");
+        LWIP_PRINTF("ERROR: Invalid parameters for UDP send\n");
         return -1;
     }
 
     connection_entry_t* conn = find_connection(id);
     if (!conn) {
-        printf("ERROR: Connection '%s' not found for UDP send\n", id);
+        LWIP_PRINTF("ERROR: Connection '%s' not found for UDP send\n", id);
         return -1;
     }
 
     ip_addr_t dest_ip;
     if (!ipaddr_aton(dest_ip_str, &dest_ip)) {
-        printf("ERROR: Invalid destination IP address for UDP send\n");
+        LWIP_PRINTF("ERROR: Invalid destination IP address for UDP send\n");
         conn_unref(conn);
         return -1;
     }
@@ -1060,7 +1066,7 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
         // Create UDP PCB only once
         conn->udp_pcb = udp_new();
         if (!conn->udp_pcb) {
-            printf("ERROR: Failed to create UDP PCB for connection '%s'\n", id);
+            LWIP_PRINTF("ERROR: Failed to create UDP PCB for connection '%s'\n", id);
             lwip_unlock();
             conn_unref(conn);
             return -1;
@@ -1069,7 +1075,7 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
         // Bind to local port
         err_t err = udp_bind(conn->udp_pcb, &conn->src_ip, 0);
         if (err != ERR_OK) {
-            printf("ERROR: UDP bind failed for connection '%s': %d\n", id, err);
+            LWIP_PRINTF("ERROR: UDP bind failed for connection '%s': %d\n", id, err);
             udp_remove(conn->udp_pcb);
             conn->udp_pcb = NULL;
             lwip_unlock();
@@ -1084,7 +1090,7 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
     // Allocate pbuf for the data
     struct pbuf* p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
     if (!p) {
-        printf("ERROR: Failed to allocate pbuf for UDP send\n");
+        LWIP_PRINTF("ERROR: Failed to allocate pbuf for UDP send\n");
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -1092,7 +1098,7 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
 
     // Copy data to pbuf
     if (pbuf_take(p, data, len) != ERR_OK) {
-        printf("ERROR: Failed to copy data to pbuf for UDP send\n");
+        LWIP_PRINTF("ERROR: Failed to copy data to pbuf for UDP send\n");
         pbuf_free(p);
         lwip_unlock();
         conn_unref(conn);
@@ -1106,7 +1112,7 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
     pbuf_free(p);
 
     if (err_sendto != ERR_OK) {
-        printf("ERROR: UDP send failed: %d\n", err_sendto);
+        LWIP_PRINTF("ERROR: UDP send failed: %d\n", err_sendto);
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -1125,7 +1131,7 @@ int lwip_udp_send(const char* id, const char* dest_ip_str, int port, const uint8
 
 void lwip_close_connection(const char* id) {
     if (!id) {
-        printf("ERROR: Invalid connection ID\n");
+        LWIP_PRINTF("ERROR: Invalid connection ID\n");
         return;
     }
 
@@ -1136,10 +1142,25 @@ void lwip_close_connection(const char* id) {
     while (conn) {
         if (conn->id && strcmp(conn->id, id) == 0) {
             // Remove from list first
+            // This prevents other threads from finding a half-closed connection
             *prev = conn->next;
             
-            // CRITICAL: Clear all callbacks to prevent use-after-free
-            // This prevents C# code from calling back into freed memory
+            // Clean up netif BEFORE tcp_abort()!
+            // tcp_abort() will call on_tcp_error() -> conn_unref()
+            // If ref_count reaches 0, conn will be freed
+            // But netif is EMBEDDED in conn, so it must be removed from netif_list FIRST!
+            
+            // Set netif down (stops packet processing)
+            netif_set_down(&conn->netif);
+            
+            // Clear netif->state to prevent output_cb access
+            conn->netif.state = NULL;
+            
+            // Remove from netif_list BEFORE tcp_abort
+            // netif must be removed while conn is still valid
+            netif_remove(&conn->netif);
+            
+            // Clear all callbacks to prevent future invocations
             conn->send_complete_callback = NULL;
             conn->send_ack_complete_callback = NULL;
             conn->udp_callback = NULL;
@@ -1154,25 +1175,22 @@ void lwip_close_connection(const char* id) {
                 conn->pending_acks_head = next;
             }
             conn->pending_acks_tail = NULL;
-
-            // Close TCP connection if active - do this BEFORE removing netif
+            
+            // Close TCP connection if active
             if (conn->pcb) {
-                // IMPORTANT: Clear persistent_mode FIRST to prevent normal callbacks
+                // Clear persistent_mode FIRST to prevent normal callbacks
                 conn->persistent_mode = 0;
                 
-                // Clear non-error callbacks
                 tcp_arg(conn->pcb, NULL);
                 tcp_sent(conn->pcb, NULL);
                 tcp_recv(conn->pcb, NULL);
+                tcp_err(conn->pcb, NULL);
                 
-                // Keep tcp_err callback - tcp_abort() will call it with ERR_ABRT
-                // on_tcp_error will then call conn_unref() to release callback reference
-                // This ensures proper cleanup without use-after-free
-                
-                tcp_abort(conn->pcb);  // This calls on_tcp_error with ERR_ABRT
+                tcp_abort(conn->pcb);
                 conn->pcb = NULL;
                 
-                // Do NOT call conn_unref here - on_tcp_error will handle it
+                // Since we cleared tcp_err, manually unref
+                conn_unref(conn);
             }
 
             // Close UDP connection if active
@@ -1181,20 +1199,12 @@ void lwip_close_connection(const char* id) {
                 conn->udp_pcb = NULL;
             }
 
-            // CRITICAL FIX: Clear netif->state BEFORE removing netif
-            // This prevents output_cb from accessing invalid state pointer
-            conn->netif.state = NULL;
-
-            // Now cleanup network interface
-            netif_set_down(&conn->netif);
-            netif_remove(&conn->netif);
+            // Release initial reference
+            conn_unref(conn);
 
             lwip_unlock();
 
-            // Release initial reference - this may trigger cleanup
-            conn_unref(conn);
-
-            printf("Connection '%s' closed and removed.\n", id);
+            LWIP_PRINTF("Connection '%s' closed and removed.\n", id);
             return;
         }
         prev = &conn->next;
@@ -1202,7 +1212,7 @@ void lwip_close_connection(const char* id) {
     }
 
     lwip_unlock();
-    printf("Connection '%s' not found to close.\n", id);
+    LWIP_PRINTF("Connection '%s' not found to close.\n", id);
 }
 
 void* ip4_route_custom(const void* src, const void* dest) {
@@ -1252,22 +1262,61 @@ void lwip_cleanup_all_connections() {
         connection_entry_t* conn = connection_list;
         connection_list = conn->next;
 
+        // Clean up netif BEFORE closing PCBs
+        // netif is embedded in conn structure, so it must be cleaned up
+        // before conn_unref() potentially frees the connection
+        
         netif_set_down(&conn->netif);
+        
+        conn->netif.state = NULL;
+        
+        // Remove from netif_list
         netif_remove(&conn->netif);
-
+        
+        // Clear TCP error callback before abort
         if (conn->pcb) {
+            tcp_arg(conn->pcb, NULL);
+            tcp_sent(conn->pcb, NULL);
+            tcp_recv(conn->pcb, NULL);
+            tcp_err(conn->pcb, NULL);
+            
             tcp_abort(conn->pcb);
+            conn->pcb = NULL;
+            
+            // Since we cleared tcp_err, manually unref
+            conn_unref(conn);
         }
 
         if (conn->udp_pcb) {
             udp_remove(conn->udp_pcb);
+            conn->udp_pcb = NULL;
         }
 
+        // Release initial reference
         conn_unref(conn);
     }
 
     lwip_unlock();
     cleanup_lwip_lock();
+}
+
+// Clear all callbacks for a connection (used by SSL wrapper on disconnect)
+void lwip_clear_connection_callbacks(const char* id) {
+    if (!id) return;
+    
+    connection_entry_t* conn = find_connection(id);
+    if (!conn) return;
+    
+    lwip_lock();
+    
+    // Clear all callbacks to prevent them from being invoked after SSL disconnect
+    conn->udp_callback = NULL;
+    conn->send_complete_callback = NULL;
+    conn->send_ack_complete_callback = NULL;
+    
+    lwip_unlock();
+    
+    conn_unref(conn);  // Release find_connection reference
 }
 
 int lwip_tcp_get_pending_ack_count(const char* id) {
@@ -1289,29 +1338,26 @@ int lwip_tcp_get_pending_ack_count(const char* id) {
     return count;
 }
 
-// Batch TCP send with TCP_WRITE_FLAG_MORE for maximum throughput
-// Combines multiple messages into fewer TCP packets
-// Prerequisites: Must have active persistent connection (lwip_tcp_connect_persistent called)
 int lwip_tcp_send_batch_optimized(const char* id,
                                    const uint8_t** data_array,
                                    const int* len_array,
                                    const char** message_ids,
                                    int batch_size) {
     if (!id || !data_array || !len_array || !message_ids || batch_size <= 0) {
-        printf("ERROR: Invalid parameters for TCP batch send\n");
+        LWIP_PRINTF("ERROR: Invalid parameters for TCP batch send\n");
         return -1;
     }
 
     connection_entry_t* conn = find_connection(id);
     if (!conn) {
-        printf("ERROR: Connection '%s' not found\n", id);
+        LWIP_PRINTF("ERROR: Connection '%s' not found\n", id);
         return -1;
     }
 
     lwip_lock();
 
     if (!conn->pcb || !conn->persistent_mode) {
-        printf("ERROR: No persistent TCP connection active for %s\n", id);
+        LWIP_PRINTF("ERROR: No persistent TCP connection active for %s\n", id);
         lwip_unlock();
         conn_unref(conn);
         return -1;
@@ -1328,7 +1374,7 @@ int lwip_tcp_send_batch_optimized(const char* id,
     // Check if buffer has enough space for entire batch
     u16_t available = tcp_sndbuf(conn->pcb);
     if ((int)available < total_bytes) {
-        printf("WARNING: TCP buffer (%d) < required (%d). Send what fits.\n", available, total_bytes);
+        LWIP_PRINTF("WARNING: TCP buffer (%d) < required (%d). Send what fits.\n", available, total_bytes);
         lwip_unlock();
         conn_unref(conn);
         return -2;  // Buffer full
@@ -1339,7 +1385,7 @@ int lwip_tcp_send_batch_optimized(const char* id,
         // Create ACK tracking entry
         pending_ack_entry_t* ack_entry = (pending_ack_entry_t*)malloc(sizeof(pending_ack_entry_t));
         if (!ack_entry) {
-            printf("ERROR: Failed to allocate ACK tracking entry\n");
+            LWIP_PRINTF("ERROR: Failed to allocate ACK tracking entry\n");
             break;
         }
 
@@ -1352,7 +1398,7 @@ int lwip_tcp_send_batch_optimized(const char* id,
         ack_entry->bytes_sent = (u16_t)len_array[i];
         ack_entry->next = NULL;
 
-        // ⭐ KEY: Use TCP_WRITE_FLAG_MORE for all except last message
+        // ? KEY: Use TCP_WRITE_FLAG_MORE for all except last message
         u8_t flags = TCP_WRITE_FLAG_COPY;
         if (i < batch_size - 1) {
             flags |= TCP_WRITE_FLAG_MORE;  // Tell TCP: more data coming, buffer it
@@ -1372,21 +1418,16 @@ int lwip_tcp_send_batch_optimized(const char* id,
             successful_sends++;
         } else {
             // Failed to write this message
-            printf("ERROR: tcp_write failed for message %d: %d\n", i, wr);
+            LWIP_PRINTF("ERROR: tcp_write failed for message %d: %d\n", i, wr);
             free(ack_entry->message_id);
             free(ack_entry);
             break;  // Stop on first failure
         }
     }
 
-    // ⭐ Flush ALL buffered data with single tcp_output() call
+    // ? Flush ALL buffered data with single tcp_output() call
     if (successful_sends > 0) {
-        tcp_output(conn->pcb);
-        
-        // Call send_complete callback once for entire batch
-        if (conn->send_complete_callback) {
-            conn->send_complete_callback();
-        }
+        tcp_output(conn->pcb);       
     }
 
     lwip_unlock();
@@ -1405,19 +1446,19 @@ int lwip_udp_send_batch_optimized(const char* id,
                                    int batch_size) {
     if (!id || !dest_ip_str || port <= 0 || port > 65535 || 
         !data_array || !len_array || batch_size <= 0) {
-        printf("ERROR: Invalid parameters for UDP batch send\n");
+        LWIP_PRINTF("ERROR: Invalid parameters for UDP batch send\n");
         return -1;
     }
 
     connection_entry_t* conn = find_connection(id);
     if (!conn) {
-        printf("ERROR: Connection '%s' not found\n", id);
+        LWIP_PRINTF("ERROR: Connection '%s' not found\n", id);
         return -1;
     }
 
     ip_addr_t dest_ip;
     if (!ipaddr_aton(dest_ip_str, &dest_ip)) {
-        printf("ERROR: Invalid destination IP address\n");
+        LWIP_PRINTF("ERROR: Invalid destination IP address\n");
         conn_unref(conn);
         return -1;
     }
@@ -1431,7 +1472,7 @@ int lwip_udp_send_batch_optimized(const char* id,
     if (conn->udp_pcb == NULL) {
         conn->udp_pcb = udp_new();
         if (!conn->udp_pcb) {
-            printf("ERROR: Failed to create UDP PCB\n");
+            LWIP_PRINTF("ERROR: Failed to create UDP PCB\n");
             lwip_unlock();
             conn_unref(conn);
             return -1;
@@ -1439,7 +1480,7 @@ int lwip_udp_send_batch_optimized(const char* id,
 
         err_t err = udp_bind(conn->udp_pcb, &conn->src_ip, 0);
         if (err != ERR_OK) {
-            printf("ERROR: UDP bind failed: %d\n", err);
+            LWIP_PRINTF("ERROR: UDP bind failed: %d\n", err);
             udp_remove(conn->udp_pcb);
             conn->udp_pcb = NULL;
             lwip_unlock();
@@ -1461,13 +1502,13 @@ int lwip_udp_send_batch_optimized(const char* id,
         // Allocate pbuf for this datagram
         struct pbuf* p = pbuf_alloc(PBUF_TRANSPORT, len_array[i], PBUF_RAM);
         if (!p) {
-            printf("ERROR: Failed to allocate pbuf for message %d\n", i);
+            LWIP_PRINTF("ERROR: Failed to allocate pbuf for message %d\n", i);
             break;  // Stop on first allocation failure
         }
 
         // Copy data to pbuf
         if (pbuf_take(p, data_array[i], len_array[i]) != ERR_OK) {
-            printf("ERROR: Failed to copy data for message %d\n", i);
+            LWIP_PRINTF("ERROR: Failed to copy data for message %d\n", i);
             pbuf_free(p);
             break;
         }
@@ -1479,7 +1520,7 @@ int lwip_udp_send_batch_optimized(const char* id,
         if (err == ERR_OK) {
             successful_sends++;
         } else {
-            printf("ERROR: UDP send failed for message %d: %d\n", i, err);
+            LWIP_PRINTF("ERROR: UDP send failed for message %d: %d\n", i, err);
             // Continue with next message (UDP is best-effort anyway)
         }
     }
