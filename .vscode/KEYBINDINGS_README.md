@@ -78,9 +78,9 @@ Latest version: 2026 (compatible with VS Code 1.85+)
 
 ## Alternative: Install ReSharper Extension
 
-You can also install the official "Resharper 9 Keybindings" extension from the VS Code Marketplace:
+You can also install the official "ReSharper 9 Keybindings" extension from the VS Code Marketplace:
 1. Open Extensions view (`Ctrl+Shift+X`)
-2. Search for "Resharper 9 Keybindings"
+2. Search for "ReSharper 9 Keybindings"
 3. Install the extension by Microsoft
 
 The extension provides similar shortcuts and is maintained by Microsoft.
