@@ -1,0 +1,158 @@
+[
+  // Navigation shortcuts
+  {
+    "key": "ctrl+n",
+    "command": "workbench.action.quickOpen",
+    "when": "!inDebugMode"
+  },
+  {
+    "key": "ctrl+shift+n",
+    "command": "workbench.action.files.newUntitledFile"
+  },
+  {
+    "key": "ctrl+m",
+    "command": "editor.action.revealDefinition",
+    "when": "editorHasDefinitionProvider && editorTextFocus"
+  },
+  {
+    "key": "ctrl+shift+alt+n",
+    "command": "workbench.action.gotoSymbol"
+  },
+  {
+    "key": "ctrl+-",
+    "command": "workbench.action.navigateBack"
+  },
+  {
+    "key": "ctrl+shift+-",
+    "command": "workbench.action.navigateForward"
+  },
+  {
+    "key": "alt+`",
+    "command": "workbench.action.showEditorsInActiveGroup"
+  },
+
+  // Editing shortcuts
+  {
+    "key": "ctrl+d",
+    "command": "editor.action.copyLinesDownAction",
+    "when": "editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "ctrl+l",
+    "command": "editor.action.deleteLines",
+    "when": "editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "ctrl+w",
+    "command": "editor.action.smartSelect.expand",
+    "when": "editorTextFocus"
+  },
+  {
+    "key": "ctrl+shift+w",
+    "command": "editor.action.smartSelect.shrink",
+    "when": "editorTextFocus"
+  },
+  {
+    "key": "ctrl+/",
+    "command": "editor.action.commentLine",
+    "when": "editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "ctrl+shift+/",
+    "command": "editor.action.blockComment",
+    "when": "editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "ctrl+alt+enter",
+    "command": "editor.action.insertLineBefore",
+    "when": "editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "ctrl+shift+enter",
+    "command": "editor.action.insertLineAfter",
+    "when": "editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "ctrl+alt+j",
+    "command": "editor.action.joinLines",
+    "when": "editorTextFocus && !editorReadonly"
+  },
+
+  // Code actions and refactoring
+  {
+    "key": "ctrl+shift+r",
+    "command": "editor.action.rename",
+    "when": "editorHasRenameProvider && editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "alt+enter",
+    "command": "editor.action.quickFix",
+    "when": "editorHasCodeActionsProvider && editorTextFocus"
+  },
+  {
+    "key": "ctrl+alt+f",
+    "command": "editor.action.formatDocument",
+    "when": "editorHasDocumentFormattingProvider && editorTextFocus && !editorReadonly"
+  },
+
+  // File and window management
+  {
+    "key": "ctrl+shift+s",
+    "command": "workbench.action.files.saveAll"
+  },
+  {
+    "key": "ctrl+alt+l",
+    "command": "workbench.files.action.showActiveFileInExplorer"
+  },
+  {
+    "key": "shift+alt+l",
+    "command": "workbench.action.files.revealActiveFileInWindows"
+  },
+
+  // Search and find
+  {
+    "key": "ctrl+shift+f",
+    "command": "workbench.action.findInFiles"
+  },
+  {
+    "key": "ctrl+shift+h",
+    "command": "workbench.action.replaceInFiles"
+  },
+  {
+    "key": "ctrl+f12",
+    "command": "editor.action.goToImplementation",
+    "when": "editorHasImplementationProvider && editorTextFocus"
+  },
+  {
+    "key": "ctrl+shift+f12",
+    "command": "references-view.findReferences",
+    "when": "editorHasReferenceProvider && editorTextFocus"
+  },
+  {
+    "key": "shift+f12",
+    "command": "editor.action.referenceSearch.trigger",
+    "when": "editorHasReferenceProvider && editorTextFocus"
+  },
+
+  // Build and debug
+  {
+    "key": "ctrl+shift+b",
+    "command": "workbench.action.tasks.build"
+  },
+  {
+    "key": "shift+f9",
+    "command": "workbench.action.debug.start",
+    "when": "debuggersAvailable && debugState == 'inactive'"
+  },
+  {
+    "key": "ctrl+f5",
+    "command": "workbench.action.debug.run",
+    "when": "debuggersAvailable"
+  },
+
+  // Terminal
+  {
+    "key": "ctrl+alt+t",
+    "command": "workbench.action.terminal.new"
+  }
+]
